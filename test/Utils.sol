@@ -4,6 +4,7 @@ pragma solidity 0.8.36;
 import {HyFi} from "../src/HyFi.sol";
 import {Addrs} from "../script/Addrs.sol";
 import {CommonBase} from "forge-std/Base.sol";
+import {console2} from "forge-std/console2.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
@@ -18,6 +19,8 @@ import {ActionConstants} from "@uniswap/v4-periphery/src/libraries/ActionConstan
 import {IV4Router} from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";
 import {Commands} from "@uniswap/universal-router/contracts/libraries/Commands.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
 interface IUniversalRouterMinimal {
     function execute(bytes calldata commands, bytes[] calldata inputs, uint deadline) external payable;
@@ -25,6 +28,7 @@ interface IUniversalRouterMinimal {
 
 interface IPermit2Minimal {
     function approve(address token, address spender, uint160 amount, uint48 expiration) external;
+    function allowance(address owner, address token, address spender) external view returns (uint160 amount, uint48 expiration, uint48 nonce);
 }
 
 /// @notice Stateless helpers + shared constants for tests and future scripts. Functions take all
@@ -46,6 +50,7 @@ contract Utils is CommonBase {
     uint160 public constant SQRT_PRICE_1_1 = 79228162514264337593543950336;
     uint24 public constant DEFAULT_FEE = 0;
     int24 public constant DEFAULT_TICK_SPACING = 1;
+    address public constant ADDR_ZERO = address(0);
 
     // ------------------------------------------------------------------
     // Hook deployment
@@ -153,6 +158,35 @@ contract Utils is CommonBase {
     function quoteToBase(uint quoteAmount, uint price, bool roundUp) public pure returns (uint) {
         return
             roundUp ? FullMath.mulDivRoundingUp(quoteAmount, SCALE, price) : FullMath.mulDiv(quoteAmount, SCALE, price);
+    }
+
+    /// @notice Converts a pool's sqrtPriceX96 into a nominal price scaled 1e18, adjusting for
+    /// each token's decimals. `invert = false` returns token0's price in terms of token1
+    /// (token1 per token0); `invert = true` returns the reciprocal (token0 per token1).
+    function getPriceFromSqrtPriceX96(uint160 sqrtPriceX96, bool invert, uint8 decimals0, uint8 decimals1)
+        public
+        pure
+        returns (uint price1e18)
+    {
+        uint ratioX192 = uint(sqrtPriceX96) * uint(sqrtPriceX96);
+        if (!invert) {
+            uint scaled = FullMath.mulDiv(ratioX192, 10 ** decimals0, 1 << 192);
+            price1e18 = FullMath.mulDiv(scaled, 1e18, 10 ** decimals1);
+        } else {
+            uint scaled = FullMath.mulDiv(1 << 192, 10 ** decimals1, ratioX192);
+            price1e18 = FullMath.mulDiv(scaled, 1e18, 10 ** decimals0);
+        }
+    }
+
+    /// @notice Implied nominal price (output per input) from a quoted in/out pair, scaled 1e18
+    function priceFromQuote(uint amountIn, uint amountOut, uint8 decimalsIn, uint8 decimalsOut)
+        public
+        pure
+        returns (uint price1e18)
+    {
+        if (amountIn == 0) return 0;
+        uint scaled = FullMath.mulDiv(amountOut, 10 ** decimalsIn, amountIn);
+        price1e18 = FullMath.mulDiv(scaled, 1e18, 10 ** decimalsOut);
     }
 
     /// @notice Staleness fee on a gross output amount
@@ -324,9 +358,51 @@ contract Utils is CommonBase {
         return IPermit2Minimal(Addrs.get(chainId, "Permit2"));
     }
 
+    function getHyFi(uint chainId) public pure returns (HyFi) {
+        return HyFi(Addrs.get(chainId, "HyFi"));
+    }
+
     /// @notice Resolves an ERC20 by its name/symbol in the address book
     function getERC20(uint chainId, string memory name) public pure returns (IERC20) {
         return IERC20(Addrs.get(chainId, name));
+    }
+
+    // ------------------------------------------------------------------
+    // Console logging
+    // ------------------------------------------------------------------
+
+    /// @notice Formats a wei-denominated amount as a trimmed nominal decimal string, e.g.
+    /// formatNumToStrDecimal(2.5e18, 18) = "2.5", formatNumToStrDecimal(3.4e6, 6) = "3.4"
+    function formatNumToStrDecimal(uint amountWei, uint8 decimals) internal pure returns (string memory) {
+        uint base = 10 ** decimals;
+        uint whole = amountWei / base;
+        uint frac = amountWei % base;
+        if (frac == 0) return Strings.toString(whole);
+
+        bytes memory fracDigits = bytes(Strings.toString(frac));
+        bytes memory padded = new bytes(decimals);
+        uint padLen = decimals - fracDigits.length;
+        for (uint i; i < padLen; ++i) {
+            padded[i] = "0";
+        }
+        for (uint i; i < fracDigits.length; ++i) {
+            padded[padLen + i] = fracDigits[i];
+        }
+
+        uint end = padded.length;
+        while (end > 0 && padded[end - 1] == "0") {
+            --end;
+        }
+        bytes memory trimmed = new bytes(end);
+        for (uint i; i < end; ++i) {
+            trimmed[i] = padded[i];
+        }
+        return string(abi.encodePacked(Strings.toString(whole), ".", trimmed));
+    }
+
+    /// @notice Logs a labeled wei-denominated token amount as "label: 2.5 NVDA"
+    function logTokenAmount(string memory label, string memory symbol, uint amount, uint8 decimals) internal pure {
+        console2.log(string.concat(label, ": ", formatNumToStrDecimal(amount, decimals), " ", symbol));
     }
 
     // ------------------------------------------------------------------
