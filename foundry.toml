@@ -16,6 +16,7 @@ remappings = [
     "@uniswap/v4-periphery/=lib/v4-periphery/",
     "@uniswap/universal-router/=lib/universal-router/",
     "permit2/=lib/v4-periphery/lib/permit2/",
+    "@uniswap/v4-hooks-public/=lib/v4-hooks-public/src/",
 ]
 
 [rpc_endpoints]
