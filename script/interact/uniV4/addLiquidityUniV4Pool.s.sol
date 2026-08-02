@@ -1,43 +1,43 @@
 pragma solidity ^0.8.30;
 
-
 import {Script, console2} from "forge-std/Script.sol";
-import {Vm} from "forge-std/Vm.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {Utils} from "../../../test/Utils.sol";
+import {Addrs} from "../../Addrs.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
-import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
+import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
-import {AddressConstants} from "hookmate/constants/AddressConstants.sol";
 import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
-import {IPermit2} from "permit2/src/interfaces/IPermit2.sol";
+import {HyFi} from "../../../src/HyFi.sol";
 
 
 contract AddLiquidityUniV4Pool is Script, Utils {
 
     using StateLibrary for IPoolManager;
 
-    uint public senderPrivateKey = vm.envUint("PRIVATE_KEY_HYFIHOOK_DEPLOYER");
+    uint public senderPrivateKey = vm.envUint("PRIVATE_KEY_HYFI_DEPLOYER");
     address public sender = vm.addr(senderPrivateKey);
 
 
     // ----------------------
-    IPoolManager public poolManager = IPoolManager(0x8366a39CC670B4001A1121B8F6A443A643e40951); // Robinhood PoolManager
-    IPositionManager public positionManager = IPositionManager(0x58daec3116aae6D93017bAAea7749052E8a04fA7); // Robinhood PositionManager
+    HyFi public hyfi = getHyFi(block.chainid);
+    IPoolManager public poolManager = getPm(block.chainid);
+    IPositionManager public positionManager = getPositionManager(block.chainid);
 
     PoolKey public poolKey = PoolKey({
-        currency0: Currency.wrap(0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168), // USDG on Robin
-        currency1: Currency.wrap(0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC), // NVDA on Robin
+        currency0: Currency.wrap(Addrs.get(block.chainid, "USDG")),
+        currency1: Currency.wrap(Addrs.get(block.chainid, "NVDA")),
         fee: 0,
         tickSpacing: 1,
-        hooks: IHooks(0x83432ccbf6A058856E90698EcB47561e25f08a88)
+        hooks: IHooks(address(hyfi))
     });
-    uint public am0 = 500e6;
+    uint public am0 = 550e6;
     uint public am1 = 0;
     int24 public tickLowerFromTickCur = 1000;
     int24 public tickUpperFromTickCur = 1001;
@@ -70,6 +70,24 @@ contract AddLiquidityUniV4Pool is Script, Utils {
         uint tokenId = getTokenIdFromTransferEvent(vm.getRecordedLogs(), sender);
         console2.log("Position created with NFT token ID: ", tokenId);
         console2.log("Done!");
+    }
+
+    /// @dev Builds the MINT_POSITION + SETTLE_PAIR action/params pair for a single-pool mint via
+    /// PositionManager.modifyLiquidities.
+    function _mintLiquidityParams(
+        PoolKey memory key,
+        int24 tickLower,
+        int24 tickUpper,
+        uint128 liquidity,
+        uint am0Max,
+        uint am1Max,
+        address recipient,
+        bytes memory hookData
+    ) internal pure returns (bytes memory actions, bytes[] memory params) {
+        actions = abi.encodePacked(uint8(Actions.MINT_POSITION), uint8(Actions.SETTLE_PAIR));
+        params = new bytes[](2);
+        params[0] = abi.encode(key, tickLower, tickUpper, liquidity, uint128(am0Max), uint128(am1Max), recipient, hookData);
+        params[1] = abi.encode(key.currency0, key.currency1);
     }
 
     /// @dev Reads current pool state, derives the tick range from `tickCur`, and computes the
@@ -113,34 +131,5 @@ contract AddLiquidityUniV4Pool is Script, Utils {
 
         am0Max = am0 + 1;
         am1Max = am1 + 1;
-    }
-
-    /// @notice Extract the NFT token ID from Transfer event logs
-    /// @param logs Array of logs from the transaction
-    /// @param recipient The address that received the NFT (minted to)
-    /// @return tokenId The token ID of the minted NFT position
-    function getTokenIdFromTransferEvent(Vm.Log[] memory logs, address recipient) internal view returns (uint tokenId) {
-        // ERC721 Transfer event signature: Transfer(address indexed from, address indexed to, uint indexed tokenId)
-        // Note: the canonical ABI type is uint256 (not the `uint` alias), which is what the event's topic0 hashes.
-        bytes32 transferEventSignature = keccak256("Transfer(address,address,uint256)");
-        
-        for (uint i = 0; i < logs.length; i++) {
-            Vm.Log memory log = logs[i];
-            
-            // Check if this is a Transfer event from the PositionManager contract
-            if (log.emitter == address(positionManager) && log.topics[0] == transferEventSignature) {
-                address from = address(uint160(uint(log.topics[1])));
-                address to = address(uint160(uint(log.topics[2])));
-                uint extractedTokenId = uint(log.topics[3]);
-                
-                // Check if this is a mint (from = address(0)) to our recipient
-                if (from == address(0) && to == recipient) {
-                    console2.log("Found Transfer event: from=0x0, to=", to, "tokenId=", extractedTokenId);
-                    return extractedTokenId;
-                }
-            }
-        }
-        
-        revert("NFT Transfer event not found - position may not have been minted");
     }
 }

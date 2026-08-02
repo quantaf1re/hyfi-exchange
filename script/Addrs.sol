@@ -13,6 +13,7 @@ library Addrs {
         bytes32 h = keccak256(bytes(name));
         if (chainId == ROBINHOOD) {
             if (h == keccak256("PoolManager")) return 0x8366a39CC670B4001A1121B8F6A443A643e40951;
+            if (h == keccak256("PositionManager")) return 0x58daec3116aae6D93017bAAea7749052E8a04fA7;
             if (h == keccak256("UniversalRouter")) return 0x8876789976dEcBfCbBbe364623C63652db8C0904;
             if (h == keccak256("Permit2")) return 0x000000000022D473030F116dDEE9F6B43aC78BA3;
             if (h == keccak256("USDG")) return 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;

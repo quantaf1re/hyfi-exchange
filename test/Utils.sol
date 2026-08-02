@@ -5,6 +5,7 @@ import {HyFi} from "../src/HyFi.sol";
 import {Addrs} from "../script/Addrs.sol";
 import {CommonBase} from "forge-std/Base.sol";
 import {console2} from "forge-std/console2.sol";
+import {Vm} from "forge-std/Vm.sol";
 import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
 import {CustomRevert} from "@uniswap/v4-core/src/libraries/CustomRevert.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
@@ -17,6 +18,7 @@ import {IERC6909Claims} from "@uniswap/v4-core/src/interfaces/external/IERC6909C
 import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
 import {ActionConstants} from "@uniswap/v4-periphery/src/libraries/ActionConstants.sol";
 import {IV4Router} from "@uniswap/v4-periphery/src/interfaces/IV4Router.sol";
+import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
 import {Commands} from "@uniswap/universal-router/contracts/libraries/Commands.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
@@ -358,6 +360,10 @@ contract Utils is CommonBase {
         return IPermit2Minimal(Addrs.get(chainId, "Permit2"));
     }
 
+    function getPositionManager(uint chainId) public pure returns (IPositionManager) {
+        return IPositionManager(Addrs.get(chainId, "PositionManager"));
+    }
+
     function getHyFi(uint chainId) public pure returns (HyFi) {
         return HyFi(Addrs.get(chainId, "HyFi"));
     }
@@ -405,6 +411,20 @@ contract Utils is CommonBase {
         console2.log(string.concat(label, ": ", formatNumToStrDecimal(amount, decimals), " ", symbol));
     }
 
+    /// @notice Extracts the `tokenId` of the first ERC721 `Transfer` event sent `to` recipient
+    /// from a set of recorded logs (see vm.recordLogs() / vm.getRecordedLogs()). Used to recover
+    /// a newly minted position NFT's ID, since PositionManager.modifyLiquidities doesn't return it.
+    function getTokenIdFromTransferEvent(Vm.Log[] memory logs, address recipient) public pure returns (uint tokenId) {
+        bytes32 transferSig = keccak256("Transfer(address,address,uint256)");
+        for (uint i; i < logs.length; ++i) {
+            Vm.Log memory log = logs[i];
+            if (log.topics.length == 4 && log.topics[0] == transferSig && address(uint160(uint(log.topics[2]))) == recipient) {
+                return uint(log.topics[3]);
+            }
+        }
+        revert("Utils: no matching Transfer event found");
+    }
+
     // ------------------------------------------------------------------
     // Onchain actions - core (no cheatcodes; broadcast-safe for mainnet scripts,
     // executed as msg.sender / the broadcaster). Wrap multi-call cores in
@@ -426,6 +446,26 @@ contract Utils is CommonBase {
     function approveRouter(IPermit2Minimal permit2, address router, address token) public {
         IERC20(token).approve(address(permit2), type(uint).max);
         permit2.approve(token, router, type(uint160).max, type(uint48).max);
+    }
+
+    /// @notice Grants `positionManager` a Permit2 allowance for both tokens of a pool as
+    /// msg.sender, so it can pull funds when minting/increasing liquidity. Skips native currency
+    /// (address(0), no approval needed) and skips tokens that already have a sufficient allowance.
+    function tokensApprovals(address owner, IPositionManager positionManager, IERC20Metadata token0, IERC20Metadata token1) public {
+        IPermit2Minimal permit2 = getPermit2(block.chainid);
+        _approveIfNeeded(owner, permit2, address(positionManager), address(token0));
+        _approveIfNeeded(owner, permit2, address(positionManager), address(token1));
+    }
+
+    function _approveIfNeeded(address owner, IPermit2Minimal permit2, address spender, address token) internal {
+        if (token == ADDR_ZERO) return; // native currency needs no approval
+        if (IERC20(token).allowance(owner, address(permit2)) < type(uint160).max) {
+            IERC20(token).approve(address(permit2), type(uint).max);
+        }
+        (uint160 amount, uint48 expiration,) = permit2.allowance(owner, token, spender);
+        if (amount < type(uint160).max || expiration < block.timestamp) {
+            permit2.approve(token, spender, type(uint160).max, type(uint48).max);
+        }
     }
 
     /// @notice Pushes a single-pair book update as msg.sender (must be the updater). The caller
