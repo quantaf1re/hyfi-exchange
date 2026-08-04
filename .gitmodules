@@ -16,3 +16,6 @@
 [submodule "lib/universal-router"]
 	path = lib/universal-router
 	url = https://github.com/Uniswap/universal-router
+[submodule "lib/v4-hooks-public"]
+	path = lib/v4-hooks-public
+	url = https://github.com/Uniswap/v4-hooks-public

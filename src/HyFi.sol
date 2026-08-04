@@ -1,27 +1,35 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: UNLICENSED
 pragma solidity 0.8.36;
 
-import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
-import {IUnlockCallback} from "@uniswap/v4-core/src/interfaces/callback/IUnlockCallback.sol";
-import {Hooks} from "@uniswap/v4-core/src/libraries/Hooks.sol";
+import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {SafeCast} from "@uniswap/v4-core/src/libraries/SafeCast.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
-import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
-import {BalanceDelta} from "@uniswap/v4-core/src/types/BalanceDelta.sol";
-import {ModifyLiquidityParams, SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
-import {BeforeSwapDelta, toBeforeSwapDelta} from "@uniswap/v4-core/src/types/BeforeSwapDelta.sol";
+import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
+import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
+import {BaseAggregatorHook} from "@uniswap/v4-hooks-public/aggregator-hooks/BaseAggregatorHook.sol";
+import {IHookStats} from "./interfaces/IHookStats.sol";
+import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /// @title HyFi
-/// @notice The onchain component of the HyFi hybrid exchange. A Uniswap v4 hook that holds all
-/// deposited liquidity as PoolManager ERC-6909 claims and prices swaps against a compressed,
+/// @notice The onchain component of the HyFi hybrid exchange. Holds all deposited liquidity as
+/// plain token balances (no ERC-6909 claims) and prices swaps against a compressed,
 /// offchain-aggregated orderbook that a permissioned updater pushes onchain every block.
+///
+/// Two swap paths, both settled with exactly two token transfers and priced by the same code:
+///  - `swapDirect`: called directly on this contract; pulls the input from the caller and pays
+///    the output to the recipient. Never touches the PoolManager and carries no protocol fee.
+///  - via Uniswap v4: this contract is a BaseAggregatorHook; the PoolManager's beforeSwap routes
+///    into `_conductSwap`, which takes the swapper's input from the PoolManager to this contract
+///    and lets the base settle the output from this contract's balance. The Uniswap pool-level
+///    protocol fee (if set by governance) is applied by the base on top.
 ///
 /// Each side of a pair's book fits in 3 storage slots:
 ///  - slot0: tipPrice (uint40, multiples of tickWidth) | timestamp (uint32, inputted) |
@@ -38,15 +46,17 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 /// only the tick words the new book actually reaches into; ticks past endTick are left dirty
 /// and are unreachable. Nothing is ever zeroed so book SSTOREs stay at the non-zero rate.
 ///
-/// Deployment: the hook address must have exactly the beforeInitialize, beforeSwap and
-/// beforeSwapReturnDelta flag bits set (mined via CREATE2).
-contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
+/// Deployment: the hook address must have exactly the beforeInitialize, beforeAddLiquidity,
+/// beforeSwap and beforeSwapReturnDelta flag bits set (mined via CREATE2, per
+/// BaseAggregatorHook.getHookPermissions).
+contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
+    using CurrencyLibrary for Currency;
     using SafeCast for uint;
 
-    // ------------------------------------------------------------------
+    // =======================================================================
     // Constants
-    // ------------------------------------------------------------------
+    // =======================================================================
 
     /// @notice Fixed-point scale of `tickWidth` (quote-wei per base-wei, scaled by 1e24)
     uint public constant SCALE = 1e24;
@@ -74,9 +84,9 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
     uint internal constant TS_ID_MASK = (MASK_32 << TS_SHIFT) | (MASK_40 << ID_SHIFT);
     uint internal constant CUR_LEFT_CLEAR = ~((MASK_8 << CUR_SHIFT) | (MASK_96 << LEFT_SHIFT));
 
-    // ------------------------------------------------------------------
+    // =======================================================================
     // Types
-    // ------------------------------------------------------------------
+    // =======================================================================
 
     struct PairConfig {
         /// @dev Quote-wei per base-wei, scaled by 1e24. Also the price distance between ticks.
@@ -122,13 +132,6 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
         SideUpdate ask;
     }
 
-    struct CallbackData {
-        bool isDeposit;
-        Currency currency;
-        uint amount;
-        address account;
-    }
-
     /// @dev In-memory walk state. cur/amountLeft are updated by the walk kernels.
     struct WalkParams {
         uint slot0;
@@ -141,7 +144,7 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
         bool isBid;
     }
 
-    /// @dev Scratch space for beforeSwap (avoids stack-too-deep)
+    /// @dev Scratch space for trades (avoids stack-too-deep)
     struct TradeState {
         PoolId poolId;
         bool isExactInput;
@@ -151,11 +154,9 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
         uint fee;
     }
 
-    // ------------------------------------------------------------------
+    // =======================================================================
     // State
-    // ------------------------------------------------------------------
-
-    IPoolManager public immutable poolManager;
+    // =======================================================================
 
     /// @notice Address permitted to push compressed book updates
     address public updater;
@@ -165,9 +166,9 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
     mapping(PoolId => PairConfig) public pairConfig;
     mapping(PoolId => Book) internal books;
 
-    // ------------------------------------------------------------------
-    // Events / errors
-    // ------------------------------------------------------------------
+    // =======================================================================
+    // Events / Errors
+    // =======================================================================
 
     event Deposit(address indexed depositor, address indexed beneficiary, Currency indexed currency, uint amount);
     event Withdrawal(address indexed recipient, Currency indexed currency, uint amount);
@@ -176,6 +177,8 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
     event PairConfigSet(
         PoolId indexed poolId, uint128 tickWidth, uint88 baseLiqUnit, uint24 feePerSecond, bool baseIsCurrency0
     );
+    /// @param sender The direct caller for swapDirect; the PoolManager for swaps via Uniswap
+    /// (the base's HookSwap event carries the v4 router sender).
     /// @param amountIn Amount the trader paid (input token)
     /// @param amountOut Net amount the trader received (output token)
     /// @param stalenessFee Fee retained by the contract in the output token, attributed to MMs
@@ -191,7 +194,6 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
         uint stalenessFee
     );
 
-    error NotPoolManager();
     error NotUpdater();
     error NotWithdrawer();
     error PairNotConfigured();
@@ -205,47 +207,24 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
     error InvalidTipPrice();
     error InsufficientLiquidity();
     error BookTooStale();
-    error HookNotImplemented();
 
-    // ------------------------------------------------------------------
+    // =======================================================================
     // Setup
-    // ------------------------------------------------------------------
+    // =======================================================================
 
-    modifier onlyPoolManager() {
-        require(msg.sender == address(poolManager), NotPoolManager());
-        _;
-    }
-
-    constructor(IPoolManager poolManager_, address owner_, address updater_, address withdrawer_) Ownable(owner_) {
-        poolManager = poolManager_;
+    constructor(IPoolManager poolManager_, address owner_, address updater_, address withdrawer_)
+        BaseAggregatorHook(poolManager_, "1.0.0")
+        Ownable(owner_)
+    {
         updater = updater_;
         withdrawer = withdrawer_;
-        Hooks.validateHookPermissions(
-            IHooks(address(this)),
-            Hooks.Permissions({
-                beforeInitialize: true,
-                afterInitialize: false,
-                beforeAddLiquidity: false,
-                afterAddLiquidity: false,
-                beforeRemoveLiquidity: false,
-                afterRemoveLiquidity: false,
-                beforeSwap: true,
-                afterSwap: false,
-                beforeDonate: false,
-                afterDonate: false,
-                beforeSwapReturnDelta: true,
-                afterSwapReturnDelta: false,
-                afterAddLiquidityReturnDelta: false,
-                afterRemoveLiquidityReturnDelta: false
-            })
-        );
         emit UpdaterSet(updater_);
         emit WithdrawerSet(withdrawer_);
     }
 
-    // ------------------------------------------------------------------
+    // =======================================================================
     // Owner
-    // ------------------------------------------------------------------
+    // =======================================================================
 
     function setUpdater(address updater_) external onlyOwner {
         updater = updater_;
@@ -268,7 +247,9 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
         uint24 feePerSecond,
         bool baseIsCurrency0
     ) external onlyOwner {
-        require(address(key.hooks) == address(this), InvalidPoolKey());
+        // HyFi pools are keyed with fee 0 and tickSpacing 1 so swapDirect can reconstruct the
+        // PoolId from the token pair alone.
+        require(address(key.hooks) == address(this) && key.fee == 0 && key.tickSpacing == 1, InvalidPoolKey());
         require(tickWidth != 0 && baseLiqUnit != 0, InvalidConfig());
         PoolId poolId = key.toId();
         pairConfig[poolId] = PairConfig(tickWidth, baseLiqUnit, feePerSecond, baseIsCurrency0);
@@ -280,20 +261,19 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
         emit PairConfigSet(poolId, tickWidth, baseLiqUnit, feePerSecond, baseIsCurrency0);
     }
 
-    // ------------------------------------------------------------------
-    // Deposits / withdrawals (all liquidity is PoolManager ERC-6909 claims)
-    // ------------------------------------------------------------------
+    // =======================================================================
+    // Deposits / Withdrawals
+    // =======================================================================
 
-    /// @notice Deposits `amount` of `currency`, credited to this contract as ERC-6909 claims.
-    /// Tokens are pulled from the caller; `beneficiary` is who the deposit is attributed to
-    /// offchain via the emitted event.
+    /// @notice Deposits `amount` of `currency` into the contract. Tokens are pulled from the
+    /// caller; `beneficiary` is who the deposit is attributed to offchain via the emitted event.
     function deposit(Currency currency, uint amount, address beneficiary) external payable {
         if (currency.isAddressZero()) {
             require(msg.value == amount, InvalidMsgValue());
         } else {
             require(msg.value == 0, InvalidMsgValue());
+            IERC20(Currency.unwrap(currency)).safeTransferFrom(msg.sender, address(this), amount);
         }
-        poolManager.unlock(abi.encode(CallbackData(true, currency, amount, msg.sender)));
         emit Deposit(msg.sender, beneficiary, currency, amount);
     }
 
@@ -301,32 +281,13 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
     /// after the offchain CEX has removed the MM's liquidity and the book has been updated.
     function withdraw(Currency currency, uint amount, address recipient) external {
         require(msg.sender == withdrawer, NotWithdrawer());
-        poolManager.unlock(abi.encode(CallbackData(false, currency, amount, recipient)));
+        currency.transfer(recipient, amount);
         emit Withdrawal(recipient, currency, amount);
     }
 
-    /// @inheritdoc IUnlockCallback
-    function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory) {
-        CallbackData memory cb = abi.decode(data, (CallbackData));
-        if (cb.isDeposit) {
-            if (cb.currency.isAddressZero()) {
-                poolManager.settle{value: cb.amount}();
-            } else {
-                poolManager.sync(cb.currency);
-                IERC20(Currency.unwrap(cb.currency)).safeTransferFrom(cb.account, address(poolManager), cb.amount);
-                poolManager.settle();
-            }
-            poolManager.mint(address(this), cb.currency.toId(), cb.amount);
-        } else {
-            poolManager.burn(address(this), cb.currency.toId(), cb.amount);
-            poolManager.take(cb.currency, cb.account, cb.amount);
-        }
-        return "";
-    }
-
-    // ------------------------------------------------------------------
-    // Book updates
-    // ------------------------------------------------------------------
+    // =======================================================================
+    // Book Updates
+    // =======================================================================
 
     /// @notice Replaces the books of the given pairs. Always updates both sides of each pair.
     /// @param updates Per-pair new tips, tick words and bookIds. Tick words are pre-packed
@@ -366,27 +327,178 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Hook: swaps
-    // ------------------------------------------------------------------
+    // =======================================================================
+    // Swaps: Direct Path
+    // =======================================================================
 
-    /// @inheritdoc IHooks
-    /// @dev Custom-curve hook: prices the swap against the compressed book, settles both legs in
-    /// ERC-6909 claims and returns deltas that zero out the core AMM swap entirely.
-    function beforeSwap(address sender, PoolKey calldata key, SwapParams calldata params, bytes calldata)
+    /// @notice Exact-input direct swap against the book, without touching the PoolManager (and
+    /// therefore without any Uniswap protocol fee). Pulls exactly `amountIn` of `tokenIn` from the
+    /// caller and sends the resulting `tokenOut` to `recipient`. `tokenIn`/`tokenOut` are raw token
+    /// addresses (address(0) = native).
+    /// @return The actual (amountIn, amountOut); amountIn == the `amountIn` argument.
+    function swapExactInDirect(address tokenIn, address tokenOut, uint amountIn, address recipient)
         external
-        onlyPoolManager
-        returns (bytes4, BeforeSwapDelta, uint24)
+        payable
+        nonReentrant
+        returns (uint, uint)
     {
-        (TradeState memory t, WalkParams memory w, Side storage side, uint slot0) =
-            _priceTrade(key.toId(), params.zeroForOne, params.amountSpecified);
+        return _swapDirect(tokenIn, tokenOut, -amountIn.toInt256(), recipient);
+    }
 
-        // Persist the walk pointer - the only book write a trade makes
+    /// @notice Exact-output direct swap against the book, without touching the PoolManager (and
+    /// therefore without any Uniswap protocol fee). Sends exactly `amountOut` of `tokenOut` to
+    /// `recipient`, pulling the required `tokenIn` from the caller. `tokenIn`/`tokenOut` are
+    /// raw token addresses (address(0) = native).
+    /// @return The actual (amountIn, amountOut); amountOut == the `amountOut` argument.
+    function swapExactOutDirect(address tokenIn, address tokenOut, uint amountOut, address recipient)
+        external
+        payable
+        nonReentrant
+        returns (uint, uint)
+    {
+        return _swapDirect(tokenIn, tokenOut, amountOut.toInt256(), recipient);
+    }
+
+    /// @dev Shared direct-swap body. Reconstructs the PoolId from the token pair (HyFi pools are
+    /// always keyed with fee 0, tickSpacing 1, and this hook), prices, and persists the trade, then
+    /// settles both legs with real token transfers. Reverts PairNotConfigured if the pair is unset.
+    /// @param amountSpecified Negative = exact input, positive = exact output (v4 convention)
+    function _swapDirect(address tokenIn, address tokenOut, int amountSpecified, address recipient)
+        internal
+        returns (uint amountIn, uint amountOut)
+    {
+        // v4 sorts currencies ascending; tokenIn is currency0 iff it is the lower address.
+        bool zeroForOne = tokenIn < tokenOut;
+        (address c0, address c1) = zeroForOne ? (tokenIn, tokenOut) : (tokenOut, tokenIn);
+
+        TradeState memory t = _trade(
+            PoolKey(Currency.wrap(c0), Currency.wrap(c1), 0, 1, IHooks(address(this))).toId(),
+            zeroForOne,
+            amountSpecified
+        );
+        (amountIn, amountOut) = (t.amountIn, t.amountOut);
+
+        // Pull the input
+        if (tokenIn == address(0)) {
+            require(msg.value >= amountIn, InvalidMsgValue());
+            // Exact-output native swaps overpay up front; refund the excess
+            uint refund = msg.value - amountIn;
+            if (refund != 0) Currency.wrap(tokenIn).transfer(msg.sender, refund);
+        } else {
+            require(msg.value == 0, InvalidMsgValue());
+            IERC20(tokenIn).safeTransferFrom(msg.sender, address(this), amountIn);
+        }
+
+        // Pay the output
+        Currency.wrap(tokenOut).transfer(recipient, amountOut);
+    }
+
+    // =======================================================================
+    // Swaps: Uniswap v4 Path (BaseAggregatorHook)
+    // =======================================================================
+
+    /// @inheritdoc BaseAggregatorHook
+    /// @dev Prices the swap and persists the walk pointer, then takes the swapper's input from
+    /// the PoolManager to this contract. Returns hasSettled = false so the base settles the
+    /// output from this contract's balance (sync/transfer/settle, or settle-with-value for
+    /// native) - two token transfers in total. The pool-level protocol fee, if any, is taken by
+    /// the base afterwards.
+    function _conductSwap(Currency, Currency takeCurrency, SwapParams calldata params, PoolId poolId)
+        internal
+        override
+        returns (uint amountSettle, uint amountTake, bool hasSettled)
+    {
+        TradeState memory t = _trade(poolId, params.zeroForOne, params.amountSpecified);
+        poolManager.take(takeCurrency, address(this), t.amountIn);
+        return (t.amountOut, t.amountIn, false);
+    }
+
+    /// @inheritdoc BaseAggregatorHook
+    /// @dev Same pricing code path as execution. The base applies the protocol fee on top.
+    function _rawQuote(bool zeroToOne, int amountSpecified, PoolId poolId)
+        internal
+        view
+        override
+        returns (uint amountUnspecified)
+    {
+        (TradeState memory t,,,) = _priceTrade(poolId, zeroToOne, amountSpecified);
+        return amountSpecified < 0 ? t.amountOut : t.amountIn;
+    }
+
+    /// @dev Pools can only be initialized for pairs the owner has configured. Since the config is
+    /// keyed by poolId, this pins the exact PoolKey (fee, tickSpacing, currencies). The base then
+    /// registers the pool and polls the token jar.
+    function _beforeInitialize(address sender, PoolKey calldata key, uint160 sqrtPriceX96)
+        internal
+        override
+        returns (bytes4)
+    {
+        require(pairConfig[key.toId()].tickWidth != 0, PairNotConfigured());
+        return super._beforeInitialize(sender, key, sqrtPriceX96);
+    }
+
+    /// @inheritdoc BaseAggregatorHook
+    /// @dev Per-pair liquidity currently available for trading from the book. Can't get the balance of
+    /// this address since it would be the amount for the 2 tokens across all pairs.
+    function pseudoTotalValueLocked(PoolId poolId) external view override returns (uint amount0, uint amount1) {
+        return _bookLiquidity(poolId);
+    }
+
+    /// @dev Raw liquidity units (0-255) stored for tick `i`, read from a side's three words.
+    function _tickUnits(uint slot0, uint wordA, uint wordB, uint i) internal pure returns (uint) {
+        if (i < HEAD_TICKS) return (slot0 >> (HEAD_SHIFT + (i << 3))) & MASK_8;
+        if (i < HEAD_TICKS + WORD_TICKS) return (wordA >> ((i - HEAD_TICKS) << 3)) & MASK_8;
+        return (wordB >> ((i - HEAD_TICKS - WORD_TICKS) << 3)) & MASK_8;
+    }
+
+    /// @dev Remaining base-wei liquidity of a side, over the ticks a trade could still consume
+    /// (curTick through endTick, honoring the partially-consumed amountLeft at curTick).
+    function _sideBase(Side storage side, uint liqUnit) internal view returns (uint baseWei) {
+        uint slot0 = side.slot0;
+        uint cur = (slot0 >> CUR_SHIFT) & MASK_8;
+        uint end = (slot0 >> END_SHIFT) & MASK_8;
+        uint amountLeft = (slot0 >> LEFT_SHIFT) & MASK_96;
+        uint wordA = side.wordA;
+        uint wordB = side.wordB;
+        for (uint i = cur; i <= end; ++i) {
+            baseWei += (i == cur && amountLeft != 0) ? amountLeft : _tickUnits(slot0, wordA, wordB, i) * liqUnit;
+        }
+    }
+
+    /// @dev Remaining bid-side liquidity valued in quote wei (each tick's base capacity x its
+    /// price). Only valid for a bid side, where tick i is priced at (tip - i) * tickWidth.
+    function _sideQuote(Side storage side, uint tickWidth, uint liqUnit) internal view returns (uint quoteWei) {
+        uint slot0 = side.slot0;
+        uint tip = slot0 & MASK_40;
+        uint cur = (slot0 >> CUR_SHIFT) & MASK_8;
+        uint end = (slot0 >> END_SHIFT) & MASK_8;
+        uint amountLeft = (slot0 >> LEFT_SHIFT) & MASK_96;
+        uint wordA = side.wordA;
+        uint wordB = side.wordB;
+        for (uint i = cur; i <= end; ++i) {
+            uint avail = (i == cur && amountLeft != 0) ? amountLeft : _tickUnits(slot0, wordA, wordB, i) * liqUnit;
+            if (avail != 0) quoteWei += FullMath.mulDiv(avail, (tip - i) * tickWidth, SCALE);
+        }
+    }
+
+    // =======================================================================
+    // Pricing
+    // =======================================================================
+
+    /// @dev Prices the trade, persists the walk pointer (the only book write a trade makes) and
+    /// emits the Trade event. Token settlement is left to the caller.
+    function _trade(PoolId poolId, bool zeroForOne, int amountSpecified) internal returns (TradeState memory t) {
+        WalkParams memory w;
+        Side storage side;
+        uint slot0;
+        (t, w, side, slot0) = _priceTrade(poolId, zeroForOne, amountSpecified);
+
+        // Persist the walk pointer
         side.slot0 = (slot0 & CUR_LEFT_CLEAR) | (w.cur << CUR_SHIFT) | (w.amountLeft << LEFT_SHIFT);
 
         emit Trade(
-            t.poolId,
-            sender,
+            poolId,
+            msg.sender,
             uint40((slot0 >> ID_SHIFT) & MASK_40),
             t.isSellingBase,
             t.isExactInput,
@@ -394,12 +506,10 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
             t.amountOut,
             t.fee
         );
-
-        return (IHooks.beforeSwap.selector, _settle(key, params.zeroForOne, t.isExactInput, t.amountIn, t.amountOut), 0);
     }
 
-    /// @dev Prices a trade against the current book with no state changes. Shared by beforeSwap
-    /// (which then persists the walk pointer and settles) and quote, so that quotes can never
+    /// @dev Prices a trade against the current book with no state changes. Shared by _trade
+    /// (which then persists the walk pointer) and the quote paths, so that quotes can never
     /// diverge from execution.
     function _priceTrade(PoolId poolId, bool zeroForOne, int amountSpecified)
         internal
@@ -454,23 +564,9 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
         }
     }
 
-    /// @dev Settles both legs in 6909 claims (take the input, pay the output) and builds the
-    /// BeforeSwapDelta that zeroes out the core swap and charges/credits the swapper.
-    function _settle(PoolKey calldata key, bool zeroForOne, bool isExactInput, uint amountIn, uint amountOut)
-        internal
-        returns (BeforeSwapDelta)
-    {
-        (Currency inC, Currency outC) = zeroForOne ? (key.currency0, key.currency1) : (key.currency1, key.currency0);
-        poolManager.mint(address(this), inC.toId(), amountIn);
-        poolManager.burn(address(this), outC.toId(), amountOut);
-        return isExactInput
-            ? toBeforeSwapDelta(amountIn.toInt128(), -amountOut.toInt128())
-            : toBeforeSwapDelta(-amountOut.toInt128(), amountIn.toInt128());
-    }
-
-    // ------------------------------------------------------------------
-    // Walk kernels
-    // ------------------------------------------------------------------
+    // =======================================================================
+    // Walk Kernels
+    // =======================================================================
 
     /// @dev Returns the liquidity (in base wei) available at tick `i`, lazily SLOADing the tick
     /// words only when the walk reaches them.
@@ -590,16 +686,18 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
         w.amountLeft = newLeft;
     }
 
-    // ------------------------------------------------------------------
+    // =======================================================================
     // Views
-    // ------------------------------------------------------------------
+    // =======================================================================
 
     /// @notice Quotes a trade using the exact same code path as execution. The result matches a
     /// swap executed against the same book state in the same second: the staleness fee accrues
     /// per second, and any preceding trade or book update changes the result. `bookId` identifies
-    /// the snapshot the quote was priced against.
+    /// the snapshot the quote was priced against. No protocol fee is included (matches
+    /// swapDirect); for the via-Uniswap amounts use the base's quote(zeroToOne, amountSpecified,
+    /// poolId), which applies the pool's protocol fee on top of this.
     /// @param amountSpecified Negative = exact input, positive = exact output (v4 convention)
-    function quote(PoolId poolId, bool zeroForOne, int amountSpecified)
+    function quoteDirect(PoolId poolId, bool zeroForOne, int amountSpecified)
         external
         view
         returns (uint amountIn, uint amountOut, uint stalenessFee, uint40 bookId)
@@ -645,37 +743,44 @@ contract HyFi is IHooks, IUnlockCallback, Ownable2Step {
         (slot0, wordA, wordB) = (side.slot0, side.wordA, side.wordB);
     }
 
-    // ------------------------------------------------------------------
-    // Other hook callbacks
-    // ------------------------------------------------------------------
+    // =======================================================================
+    // URC-3 Hook Stats Reporting
+    // =======================================================================
 
-    /// @inheritdoc IHooks
-    /// @dev Pools can only be initialized for pairs the owner has configured. Since the config is
-    /// keyed by poolId, this pins the exact PoolKey (fee, tickSpacing, currencies).
-    function beforeInitialize(address, PoolKey calldata key, uint160) external view onlyPoolManager returns (bytes4) {
-        require(pairConfig[key.toId()].tickWidth != 0, PairNotConfigured());
-        return IHooks.beforeInitialize.selector;
+    /// @dev Shared book-liquidity accounting behind `pseudoTotalValueLocked`, `getReserves` and
+    /// `getEffectiveLiquidity`: the ask side's remaining base-wei and the bid side's remaining
+    /// value in quote-wei, ordered by which currency is the pair's base.
+    function _bookLiquidity(PoolId poolId) internal view returns (uint amount0, uint amount1) {
+        PairConfig memory cfg = pairConfig[poolId];
+        Book storage book = books[poolId];
+        uint baseAmt = _sideBase(book.ask, cfg.baseLiqUnit);
+        uint quoteAmt = _sideQuote(book.bid, cfg.tickWidth, cfg.baseLiqUnit);
+        (amount0, amount1) = cfg.baseIsCurrency0 ? (baseAmt, quoteAmt) : (quoteAmt, baseAmt);
     }
 
-    // Unused hooks - no permission flags set, so the PoolManager never calls them. Adding/removing
-    // v4 concentrated liquidity is permitted, but that liquidity is never used by trades:
-    // beforeSwap always returns a delta that zeroes out the core swap, so the AMM curve never
-    // executes (and this contract never calls poolManager.swap itself, the one path that would
-    // skip the hook).
-    function afterInitialize(address, PoolKey calldata, uint160, int24)
-        external pure returns (bytes4) { revert HookNotImplemented(); }
-    function beforeAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
-        external pure returns (bytes4) { revert HookNotImplemented(); }
-    function afterAddLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, BalanceDelta, BalanceDelta, bytes calldata)
-        external pure returns (bytes4, BalanceDelta) { revert HookNotImplemented(); }
-    function beforeRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, bytes calldata)
-        external pure returns (bytes4) { revert HookNotImplemented(); }
-    function afterRemoveLiquidity(address, PoolKey calldata, ModifyLiquidityParams calldata, BalanceDelta, BalanceDelta, bytes calldata)
-        external pure returns (bytes4, BalanceDelta) { revert HookNotImplemented(); }
-    function afterSwap(address, PoolKey calldata, SwapParams calldata, BalanceDelta, bytes calldata)
-        external pure returns (bytes4, int128) { revert HookNotImplemented(); }
-    function beforeDonate(address, PoolKey calldata, uint, uint, bytes calldata)
-        external pure returns (bytes4) { revert HookNotImplemented(); }
-    function afterDonate(address, PoolKey calldata, uint, uint, bytes calldata)
-        external pure returns (bytes4) { revert HookNotImplemented(); }
+    /// @inheritdoc IHookStats
+    /// @dev The book IS the hook's reserves (no separate custody to report): everything the hook
+    /// holds for a pair is either sitting in the ask/bid book or already claimed by a trade, so
+    /// this reuses the exact same per-pair book accounting as `pseudoTotalValueLocked`.
+    function getReserves(PoolKey calldata key) external view returns (uint amount0, uint amount1) {
+        return _bookLiquidity(key.toId());
+    }
+
+    /// @inheritdoc IHookStats
+    /// @dev All of HyFi's book liquidity is immediately swappable (no time-locks, vaults or
+    /// utilization limits), so effective liquidity equals total reserves - same underlying
+    /// accounting as `pseudoTotalValueLocked`/`getReserves`.
+    function getEffectiveLiquidity(PoolKey calldata key) external view returns (uint amount0, uint amount1) {
+        return _bookLiquidity(key.toId());
+    }
+
+    /// @inheritdoc IHookStats
+    function hook() external view returns (address) {
+        return address(this);
+    }
+
+    /// @inheritdoc IERC165
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+        return interfaceId == type(IHookStats).interfaceId || interfaceId == type(IERC165).interfaceId;
+    }
 }

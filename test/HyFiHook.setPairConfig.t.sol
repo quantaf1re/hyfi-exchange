@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: UNLICENSED
 pragma solidity 0.8.36;
 
 import {HyFiSetup} from "./HyFiSetup.sol";
@@ -63,7 +63,8 @@ contract HyFiHookSetPairConfigTest is HyFiSetup {
         _updateBookAt(nvdaPair, nvdaPair.bidTip, nvdaPair.askTip, DEFAULT_TICKS, DEFAULT_TICKS, uint32(block.timestamp));
         uint before = usdg.balanceOf(trader);
         swapExactInAs(router, nvdaPair.key, nvdaPair.baseIsCurrency0, trader, true, 0.2e18, 0);
-        assertEq(usdg.balanceOf(trader) - before, 36_000_000, "0.2 NVDA @ $180.00 = 36 USDG");
+        // via-Uniswap: 0.2 NVDA @ $180.00 = 36 USDG gross, less the 0.1% protocol fee => 35.964 USDG
+        assertEq(usdg.balanceOf(trader) - before, 36_000_000 - _uniFeeExactIn(36_000_000), "0.2 NVDA @ $180.00 net of protocol fee");
     }
 
     function test_setPairConfig_RevertWhen_notOwner() public {
@@ -75,6 +76,22 @@ contract HyFiHookSetPairConfigTest is HyFiSetup {
     function test_setPairConfig_RevertWhen_hookNotSelf() public {
         PoolKey memory key = nvdaPair.key;
         key.hooks = IHooks(address(0xdead));
+        vm.prank(owner);
+        vm.expectRevert(HyFi.InvalidPoolKey.selector);
+        hyfi.setPairConfig(key, 1, 1, 0, false);
+    }
+
+    function test_setPairConfig_RevertWhen_feeNonZero() public {
+        PoolKey memory key = nvdaPair.key;
+        key.fee = 500;
+        vm.prank(owner);
+        vm.expectRevert(HyFi.InvalidPoolKey.selector);
+        hyfi.setPairConfig(key, 1, 1, 0, false);
+    }
+
+    function test_setPairConfig_RevertWhen_tickSpacingNot1() public {
+        PoolKey memory key = nvdaPair.key;
+        key.tickSpacing = 60;
         vm.prank(owner);
         vm.expectRevert(HyFi.InvalidPoolKey.selector);
         hyfi.setPairConfig(key, 1, 1, 0, false);

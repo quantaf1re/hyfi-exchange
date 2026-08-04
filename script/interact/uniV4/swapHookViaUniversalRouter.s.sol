@@ -63,8 +63,10 @@ contract SwapHookViaUniversalRouter is Script, Utils {
         require(address(universalRouter) != ADDR_ZERO, "set UNIVERSAL_ROUTER_ADDRESS");
         require(address(pm) != ADDR_ZERO, "pm not deployed on this chain");
 
-        vm.startBroadcast(senderPrivateKey);
-
+        // --- read-only: pool state + quote --------------------------------
+        // Deliberately BEFORE vm.startBroadcast: `hyfi.quote` (the routed, fee-inclusive quote)
+        // isn't declared `view` (it may cache the protocol-fee token jar on first use), so calling
+        // it here keeps it a local simulation instead of a real broadcast transaction.
         (uint160 sqrtPriceX96, int24 tick, , uint24 lpFee) = pm.getSlot0(poolKey.toId());
         require(sqrtPriceX96 != 0, "pool not initialized");
         uint priceT0ToT1 = getPriceFromSqrtPriceX96(sqrtPriceX96, false, 18, token1.decimals());
@@ -73,6 +75,8 @@ contract SwapHookViaUniversalRouter is Script, Utils {
         bool inputIsNative = inputCurrency.isAddressZero();
         uint minAmountOut = _computeMinAmountOut();
         console2.log("Min amount out (buffered): %e", minAmountOut);
+
+        vm.startBroadcast(senderPrivateKey);
 
         _prepareInput();
         uint balInBefore = inputCurrency.balanceOf(sender);
@@ -135,15 +139,17 @@ contract SwapHookViaUniversalRouter is Script, Utils {
         vm.stopBroadcast();
     }
 
-    /// @dev Quotes the swap directly against HyFi (the same accounting `beforeSwap` uses),
-    ///      logs the implied forward and reverse prices from that quote (both 1e18-scaled),
-    ///      and applies a slippage buffer on top of the quoted output.
-    function _computeMinAmountOut() internal view returns (uint) {
-        (uint quotedIn, uint expectedOut,,) = hyfi.quote(poolKey.toId(), swapZeroForOne, -int256(amountIn));
+    /// @dev Quotes the swap through the routed (fee-inclusive) entrypoint - the same accounting
+    ///      `beforeSwap` applies: HyFi's book price, plus any live Uniswap protocol fee on top.
+    ///      Logs the implied forward and reverse prices (both 1e18-scaled) and applies a slippage
+    ///      buffer on top of the quoted output for price movement between quoting and execution.
+    ///      Must be called before `vm.startBroadcast` - see the note in `run()`.
+    function _computeMinAmountOut() internal returns (uint) {
+        uint expectedOut = hyfi.quote(swapZeroForOne, -int256(amountIn), poolKey.toId());
 
-        uint impliedPriceForward = priceFromQuote(quotedIn, expectedOut, inDecimals, outDecimals);
-        uint impliedPriceReverse = priceFromQuote(expectedOut, quotedIn, outDecimals, inDecimals);
-        console2.log("=== Hook Quote ===");
+        uint impliedPriceForward = priceFromQuote(amountIn, expectedOut, inDecimals, outDecimals);
+        uint impliedPriceReverse = priceFromQuote(expectedOut, amountIn, outDecimals, inDecimals);
+        console2.log("=== Hook Quote (net of protocol fee) ===");
         logTokenAmount("Hook quote implied price (output per input)", "1e18", impliedPriceForward, 18);
         logTokenAmount("Hook quote implied price (input per output)", "1e18", impliedPriceReverse, 18);
 

@@ -16,6 +16,14 @@ remappings = [
     "@uniswap/v4-periphery/=lib/v4-periphery/",
     "@uniswap/universal-router/=lib/universal-router/",
     "permit2/=lib/v4-periphery/lib/permit2/",
+    "@uniswap/v4-hooks-public/=lib/v4-hooks-public/src/",
+    "@protocol-fees/=lib/v4-hooks-public/lib/protocol-fees/src/",
+    # Force v4-hooks-public (and its protocol-fees dep) to compile against our lib copies
+    # so shared types (PoolKey, Currency, ...) are identical across the project
+    "lib/v4-hooks-public/:@uniswap/v4-core/=lib/v4-core/",
+    "lib/v4-hooks-public/:@uniswap/v4-periphery/=lib/v4-periphery/",
+    "lib/v4-hooks-public/:@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
+    "lib/v4-hooks-public/:v4-core/=lib/v4-core/src/",
 ]
 
 [rpc_endpoints]
