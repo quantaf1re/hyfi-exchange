@@ -4,7 +4,6 @@ pragma solidity 0.8.36;
 import {Script, console2} from "forge-std/Script.sol";
 import {HyFi} from "../../../src/HyFi.sol";
 import {Utils} from "../../../test/Utils.sol";
-import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
@@ -28,38 +27,38 @@ contract Deposit is Script, Utils {
     function run() external {
         uint chainId = block.chainid;
         HyFi hyfi = getHyFi(chainId);
-        IPoolManager pm = getPm(chainId);
 
         uint privateKey = vm.envUint("PRIVATE_KEY_HYFI_DEPLOYER");
         address sender = vm.addr(privateKey);
         address recipient = beneficiary == address(0) ? sender : beneficiary;
 
-        Currency currency = isNative ? Currency.wrap(address(0)) : Currency.wrap(address(getERC20(chainId, tokenName)));
+        IERC20 token = isNative ? IERC20(address(0)) : getERC20(chainId, tokenName);
         bool needsApproval;
         uint allowanceBefore;
-        if (!currency.isAddressZero()) {
-            allowanceBefore = IERC20(Currency.unwrap(currency)).allowance(sender, address(hyfi));
+        if (!isNative) {
+            allowanceBefore = token.allowance(sender, address(hyfi));
             needsApproval = allowanceBefore < amount;
         }
-        uint claimsBefore = claims(pm, address(hyfi), currency);
+        // HyFi custodies deposits directly as real ERC20/native balances (no PoolManager 6909 claims)
+        uint hookBalanceBefore = isNative ? address(hyfi).balance : token.balanceOf(address(hyfi));
 
         console2.log("=== Depositing to HyFi ===");
         console2.log("chainId:", chainId);
         console2.log("hook:", address(hyfi));
         console2.log("depositor:", sender);
         console2.log("beneficiary:", recipient);
-        console2.log("currency:", Currency.unwrap(currency));
+        console2.log("currency:", address(token));
         console2.log("amount:", amount);
         console2.log(needsApproval ? "Approval needed, will approve" : "Approval not needed, skipping");
 
         vm.startBroadcast(privateKey);
         if (needsApproval) {
-            IERC20(Currency.unwrap(currency)).approve(address(hyfi), amount);
+            token.approve(address(hyfi), amount);
         }
-        if (currency.isAddressZero()) {
-            hyfi.deposit{value: amount}(currency, amount, recipient);
+        if (isNative) {
+            hyfi.deposit{value: amount}(Currency.wrap(address(0)), amount, recipient);
         } else {
-            hyfi.deposit(currency, amount, recipient);
+            hyfi.deposit(Currency.wrap(address(token)), amount, recipient);
         }
         vm.stopBroadcast();
 
@@ -67,9 +66,9 @@ contract Deposit is Script, Utils {
         // Verify
         // ------------------------------------------------------------------
         console2.log("\n=== Verification ===");
-        uint claimsAfter = claims(pm, address(hyfi), currency);
-        require(claimsAfter == claimsBefore + amount, "Deposit: hook 6909 claims did not increase by amount");
-        console2.log("Hook 6909 claims increased by", amount);
+        uint hookBalanceAfter = isNative ? address(hyfi).balance : token.balanceOf(address(hyfi));
+        require(hookBalanceAfter == hookBalanceBefore + amount, "Deposit: hook balance did not increase by amount");
+        console2.log("Hook balance increased by", amount);
         console2.log("Deposit completed successfully!");
     }
 }

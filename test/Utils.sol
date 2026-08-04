@@ -45,8 +45,8 @@ contract Utils is CommonBase {
     uint public constant PIPS = 1e6; // must match HyFi.PIPS
     uint public constant NUM_TICKS = 68; // must match HyFi.NUM_TICKS
 
-    /// @dev beforeInitialize | beforeSwap | beforeSwapReturnDelta
-    uint160 public constant HOOK_FLAGS = uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG);
+    /// @dev beforeInitialize | beforeAddLiquidity | beforeSwap | beforeSwapReturnDelta
+    uint160 public constant HOOK_FLAGS = uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG);
     uint160 internal constant ALL_HOOK_MASK = uint160((1 << 14) - 1);
 
     uint160 public constant SQRT_PRICE_1_1 = 79228162514264337593543950336;
@@ -365,7 +365,7 @@ contract Utils is CommonBase {
     }
 
     function getHyFi(uint chainId) public pure returns (HyFi) {
-        return HyFi(Addrs.get(chainId, "HyFi"));
+        return HyFi(payable(Addrs.get(chainId, "HyFi")));
     }
 
     /// @notice Resolves an ERC20 by its name/symbol in the address book
@@ -537,6 +537,48 @@ contract Utils is CommonBase {
         vm.stopPrank();
     }
 
+    /// @notice Direct exact-input swap on the hook as `user`. Approves the hook for the ERC20
+    /// input (or forwards msg.value for native); `recipient` receives the output.
+    function swapExactInDirectAs(
+        HyFi hyfi,
+        address user,
+        address tokenIn,
+        address tokenOut,
+        uint amountIn,
+        address recipient
+    ) public returns (uint aIn, uint aOut) {
+        vm.startPrank(user);
+        if (tokenIn == ADDR_ZERO) {
+            (aIn, aOut) = hyfi.swapExactInDirect{value: amountIn}(tokenIn, tokenOut, amountIn, recipient);
+        } else {
+            IERC20(tokenIn).approve(address(hyfi), amountIn);
+            (aIn, aOut) = hyfi.swapExactInDirect(tokenIn, tokenOut, amountIn, recipient);
+        }
+        vm.stopPrank();
+    }
+
+    /// @notice Direct exact-output swap on the hook as `user`. For ERC20 input the hook is
+    /// approved for `maxInOrValue`; for native input `maxInOrValue` is forwarded as msg.value
+    /// (over-funded, the excess is refunded). `recipient` receives the output.
+    function swapExactOutDirectAs(
+        HyFi hyfi,
+        address user,
+        address tokenIn,
+        address tokenOut,
+        uint amountOut,
+        address recipient,
+        uint maxInOrValue
+    ) public returns (uint aIn, uint aOut) {
+        vm.startPrank(user);
+        if (tokenIn == ADDR_ZERO) {
+            (aIn, aOut) = hyfi.swapExactOutDirect{value: maxInOrValue}(tokenIn, tokenOut, amountOut, recipient);
+        } else {
+            IERC20(tokenIn).approve(address(hyfi), maxInOrValue);
+            (aIn, aOut) = hyfi.swapExactOutDirect(tokenIn, tokenOut, amountOut, recipient);
+        }
+        vm.stopPrank();
+    }
+
     function approveRouterAs(IPermit2Minimal permit2, address router, address user, address token) public {
         vm.startPrank(user);
         approveRouter(permit2, router, token);
@@ -600,6 +642,65 @@ contract Utils is CommonBase {
         returns (uint slot0, uint wordA, uint wordB)
     {
         return hyfi.getBookSideRaw(id, isSellingBase);
+    }
+
+    // ------------------------------------------------------------------
+    // Trade snapshots (used by both swap paths' invariant assertions)
+    // ------------------------------------------------------------------
+
+    struct SideSnap {
+        uint40 tip;
+        uint32 ts;
+        uint40 bookId;
+        uint8 cur;
+        uint8 end;
+        uint96 left;
+        uint8[68] ticks;
+    }
+
+    struct TradeSnap {
+        Currency inC;
+        Currency outC;
+        bool tradedBid; // selling base hits the bid side
+        uint traderIn;
+        uint traderOut;
+        uint hookIn;
+        uint hookOut;
+        uint pmIn;
+        uint pmOut;
+        uint jarIn; // protocol-fee token jar, input currency
+        uint jarOut; // protocol-fee token jar, output currency
+        SideSnap tradedSide;
+        SideSnap otherSide;
+    }
+
+    /// @notice Decoded snapshot of one side of `id`'s book
+    function snapSide(HyFi hyfi, PoolId id, bool bidSide) public view returns (SideSnap memory s) {
+        (s.tip, s.ts, s.bookId, s.cur, s.end, s.left, s.ticks) = hyfi.getBookSide(id, bidSide);
+    }
+
+    /// @notice Snapshots everything a trade on `key`'s pair can touch: input/output balances of
+    /// `trader`, the hook, the PoolManager and the protocol-fee token jar, and both sides of the
+    /// book. The jar only moves on the via-Uniswap path (the direct path never touches it).
+    function snapTrade(HyFi hyfi, IPoolManager pm, address trader, address jar, PoolKey memory key, bool baseIsCurrency0, bool sellingBase)
+        public
+        view
+        returns (TradeSnap memory s)
+    {
+        PoolId id = key.toId();
+        s.tradedBid = sellingBase;
+        bool zeroForOne = sellingBase == baseIsCurrency0;
+        (s.inC, s.outC) = zeroForOne ? (key.currency0, key.currency1) : (key.currency1, key.currency0);
+        s.traderIn = s.inC.balanceOf(trader);
+        s.traderOut = s.outC.balanceOf(trader);
+        s.hookIn = s.inC.balanceOf(address(hyfi));
+        s.hookOut = s.outC.balanceOf(address(hyfi));
+        s.pmIn = s.inC.balanceOf(address(pm));
+        s.pmOut = s.outC.balanceOf(address(pm));
+        s.jarIn = s.inC.balanceOf(jar);
+        s.jarOut = s.outC.balanceOf(jar);
+        s.tradedSide = snapSide(hyfi, id, sellingBase);
+        s.otherSide = snapSide(hyfi, id, !sellingBase);
     }
 
     // ------------------------------------------------------------------
