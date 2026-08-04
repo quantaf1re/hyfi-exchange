@@ -3,17 +3,16 @@ pragma solidity ^0.8.30;
 import {Script, console2} from "forge-std/Script.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {Utils} from "../../../test/Utils.sol";
+import {Addrs} from "../../Addrs.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
-import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionManager.sol";
 import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
-import {AddressConstants} from "hookmate/constants/AddressConstants.sol";
 import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
-import {IPermit2} from "permit2/src/interfaces/IPermit2.sol";
 import {PositionInfo, PositionInfoLibrary} from "@uniswap/v4-periphery/src/libraries/PositionInfoLibrary.sol";
 import {Actions} from "@uniswap/v4-periphery/src/libraries/Actions.sol";
 
@@ -22,15 +21,15 @@ contract RemoveLiquidityUniV4Pool is Script, Utils {
     using StateLibrary for IPoolManager;
     using PositionInfoLibrary for PositionInfo;
 
-    uint public senderPrivateKey = vm.envUint("PRIVATE_KEY_HYFIHOOK_DEPLOYER");
+    uint public senderPrivateKey = vm.envUint("PRIVATE_KEY_HYFI_DEPLOYER");
     address public sender = vm.addr(senderPrivateKey);
 
 
     // ----------------------
-    IPoolManager public poolManager = IPoolManager(0x8366a39CC670B4001A1121B8F6A443A643e40951); // Robinhood PoolManager
-    IPositionManager public positionManager = IPositionManager(0x58daec3116aae6D93017bAAea7749052E8a04fA7); // Robinhood PositionManager
+    IPoolManager public poolManager = getPm(block.chainid);
+    IPositionManager public positionManager = getPositionManager(block.chainid);
 
-    uint public tokenId = 274742; // TODO
+    uint public tokenId = 422164; // TODO
     // ----------------------
 
 
@@ -145,5 +144,20 @@ contract RemoveLiquidityUniV4Pool is Script, Utils {
     /// @param _tokenId The NFT token ID of the position
     function setTokenId(uint _tokenId) public {
         tokenId = _tokenId;
+    }
+
+    /// @dev Builds the BURN_POSITION + TAKE_PAIR action/params pair for a single-pool burn via
+    /// PositionManager.modifyLiquidities.
+    function _burnLiquidityParams(
+        PoolKey memory key,
+        uint tokenId,
+        uint am0Min,
+        uint am1Min,
+        address recipient
+    ) internal pure returns (bytes memory actions, bytes[] memory params) {
+        actions = abi.encodePacked(uint8(Actions.BURN_POSITION), uint8(Actions.TAKE_PAIR));
+        params = new bytes[](2);
+        params[0] = abi.encode(tokenId, uint128(am0Min), uint128(am1Min), new bytes(0));
+        params[1] = abi.encode(key.currency0, key.currency1, recipient);
     }
 }
