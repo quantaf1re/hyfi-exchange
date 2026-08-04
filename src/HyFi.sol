@@ -10,6 +10,8 @@ import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {BaseAggregatorHook} from "@uniswap/v4-hooks-public/aggregator-hooks/BaseAggregatorHook.sol";
+import {IHookStats} from "./interfaces/IHookStats.sol";
+import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
@@ -47,14 +49,14 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 /// Deployment: the hook address must have exactly the beforeInitialize, beforeAddLiquidity,
 /// beforeSwap and beforeSwapReturnDelta flag bits set (mined via CREATE2, per
 /// BaseAggregatorHook.getHookPermissions).
-contract HyFi is BaseAggregatorHook, Ownable2Step, ReentrancyGuardTransient {
+contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
     using CurrencyLibrary for Currency;
     using SafeCast for uint;
 
-    // ------------------------------------------------------------------
+    // =======================================================================
     // Constants
-    // ------------------------------------------------------------------
+    // =======================================================================
 
     /// @notice Fixed-point scale of `tickWidth` (quote-wei per base-wei, scaled by 1e24)
     uint public constant SCALE = 1e24;
@@ -82,9 +84,9 @@ contract HyFi is BaseAggregatorHook, Ownable2Step, ReentrancyGuardTransient {
     uint internal constant TS_ID_MASK = (MASK_32 << TS_SHIFT) | (MASK_40 << ID_SHIFT);
     uint internal constant CUR_LEFT_CLEAR = ~((MASK_8 << CUR_SHIFT) | (MASK_96 << LEFT_SHIFT));
 
-    // ------------------------------------------------------------------
+    // =======================================================================
     // Types
-    // ------------------------------------------------------------------
+    // =======================================================================
 
     struct PairConfig {
         /// @dev Quote-wei per base-wei, scaled by 1e24. Also the price distance between ticks.
@@ -152,9 +154,9 @@ contract HyFi is BaseAggregatorHook, Ownable2Step, ReentrancyGuardTransient {
         uint fee;
     }
 
-    // ------------------------------------------------------------------
+    // =======================================================================
     // State
-    // ------------------------------------------------------------------
+    // =======================================================================
 
     /// @notice Address permitted to push compressed book updates
     address public updater;
@@ -164,9 +166,9 @@ contract HyFi is BaseAggregatorHook, Ownable2Step, ReentrancyGuardTransient {
     mapping(PoolId => PairConfig) public pairConfig;
     mapping(PoolId => Book) internal books;
 
-    // ------------------------------------------------------------------
-    // Events / errors
-    // ------------------------------------------------------------------
+    // =======================================================================
+    // Events / Errors
+    // =======================================================================
 
     event Deposit(address indexed depositor, address indexed beneficiary, Currency indexed currency, uint amount);
     event Withdrawal(address indexed recipient, Currency indexed currency, uint amount);
@@ -206,9 +208,9 @@ contract HyFi is BaseAggregatorHook, Ownable2Step, ReentrancyGuardTransient {
     error InsufficientLiquidity();
     error BookTooStale();
 
-    // ------------------------------------------------------------------
+    // =======================================================================
     // Setup
-    // ------------------------------------------------------------------
+    // =======================================================================
 
     constructor(IPoolManager poolManager_, address owner_, address updater_, address withdrawer_)
         BaseAggregatorHook(poolManager_, "1.0.0")
@@ -220,9 +222,9 @@ contract HyFi is BaseAggregatorHook, Ownable2Step, ReentrancyGuardTransient {
         emit WithdrawerSet(withdrawer_);
     }
 
-    // ------------------------------------------------------------------
+    // =======================================================================
     // Owner
-    // ------------------------------------------------------------------
+    // =======================================================================
 
     function setUpdater(address updater_) external onlyOwner {
         updater = updater_;
@@ -259,9 +261,9 @@ contract HyFi is BaseAggregatorHook, Ownable2Step, ReentrancyGuardTransient {
         emit PairConfigSet(poolId, tickWidth, baseLiqUnit, feePerSecond, baseIsCurrency0);
     }
 
-    // ------------------------------------------------------------------
-    // Deposits / withdrawals (all liquidity is held by this contract)
-    // ------------------------------------------------------------------
+    // =======================================================================
+    // Deposits / Withdrawals
+    // =======================================================================
 
     /// @notice Deposits `amount` of `currency` into the contract. Tokens are pulled from the
     /// caller; `beneficiary` is who the deposit is attributed to offchain via the emitted event.
@@ -283,9 +285,9 @@ contract HyFi is BaseAggregatorHook, Ownable2Step, ReentrancyGuardTransient {
         emit Withdrawal(recipient, currency, amount);
     }
 
-    // ------------------------------------------------------------------
-    // Book updates
-    // ------------------------------------------------------------------
+    // =======================================================================
+    // Book Updates
+    // =======================================================================
 
     /// @notice Replaces the books of the given pairs. Always updates both sides of each pair.
     /// @param updates Per-pair new tips, tick words and bookIds. Tick words are pre-packed
@@ -325,9 +327,9 @@ contract HyFi is BaseAggregatorHook, Ownable2Step, ReentrancyGuardTransient {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Swaps: direct path
-    // ------------------------------------------------------------------
+    // =======================================================================
+    // Swaps: Direct Path
+    // =======================================================================
 
     /// @notice Exact-input direct swap against the book, without touching the PoolManager (and
     /// therefore without any Uniswap protocol fee). Pulls exactly `amountIn` of `tokenIn` from the
@@ -391,9 +393,9 @@ contract HyFi is BaseAggregatorHook, Ownable2Step, ReentrancyGuardTransient {
         Currency.wrap(tokenOut).transfer(recipient, amountOut);
     }
 
-    // ------------------------------------------------------------------
-    // Swaps: Uniswap v4 path (BaseAggregatorHook)
-    // ------------------------------------------------------------------
+    // =======================================================================
+    // Swaps: Uniswap v4 Path (BaseAggregatorHook)
+    // =======================================================================
 
     /// @inheritdoc BaseAggregatorHook
     /// @dev Prices the swap and persists the walk pointer, then takes the swapper's input from
@@ -439,11 +441,7 @@ contract HyFi is BaseAggregatorHook, Ownable2Step, ReentrancyGuardTransient {
     /// @dev Per-pair liquidity currently available for trading from the book. Can't get the balance of
     /// this address since it would be the amount for the 2 tokens across all pairs.
     function pseudoTotalValueLocked(PoolId poolId) external view override returns (uint amount0, uint amount1) {
-        PairConfig memory cfg = pairConfig[poolId];
-        Book storage book = books[poolId];
-        uint baseAmt = _sideBase(book.ask, cfg.baseLiqUnit);
-        uint quoteAmt = _sideQuote(book.bid, cfg.tickWidth, cfg.baseLiqUnit);
-        (amount0, amount1) = cfg.baseIsCurrency0 ? (baseAmt, quoteAmt) : (quoteAmt, baseAmt);
+        return _bookLiquidity(poolId);
     }
 
     /// @dev Raw liquidity units (0-255) stored for tick `i`, read from a side's three words.
@@ -483,9 +481,9 @@ contract HyFi is BaseAggregatorHook, Ownable2Step, ReentrancyGuardTransient {
         }
     }
 
-    // ------------------------------------------------------------------
+    // =======================================================================
     // Pricing
-    // ------------------------------------------------------------------
+    // =======================================================================
 
     /// @dev Prices the trade, persists the walk pointer (the only book write a trade makes) and
     /// emits the Trade event. Token settlement is left to the caller.
@@ -566,9 +564,9 @@ contract HyFi is BaseAggregatorHook, Ownable2Step, ReentrancyGuardTransient {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Walk kernels
-    // ------------------------------------------------------------------
+    // =======================================================================
+    // Walk Kernels
+    // =======================================================================
 
     /// @dev Returns the liquidity (in base wei) available at tick `i`, lazily SLOADing the tick
     /// words only when the walk reaches them.
@@ -688,9 +686,9 @@ contract HyFi is BaseAggregatorHook, Ownable2Step, ReentrancyGuardTransient {
         w.amountLeft = newLeft;
     }
 
-    // ------------------------------------------------------------------
+    // =======================================================================
     // Views
-    // ------------------------------------------------------------------
+    // =======================================================================
 
     /// @notice Quotes a trade using the exact same code path as execution. The result matches a
     /// swap executed against the same book state in the same second: the staleness fee accrues
@@ -743,5 +741,46 @@ contract HyFi is BaseAggregatorHook, Ownable2Step, ReentrancyGuardTransient {
     function getBookSideRaw(PoolId poolId, bool isSellingBase) external view returns (uint slot0, uint wordA, uint wordB) {
         Side storage side = isSellingBase ? books[poolId].bid : books[poolId].ask;
         (slot0, wordA, wordB) = (side.slot0, side.wordA, side.wordB);
+    }
+
+    // =======================================================================
+    // URC-3 Hook Stats Reporting
+    // =======================================================================
+
+    /// @dev Shared book-liquidity accounting behind `pseudoTotalValueLocked`, `getReserves` and
+    /// `getEffectiveLiquidity`: the ask side's remaining base-wei and the bid side's remaining
+    /// value in quote-wei, ordered by which currency is the pair's base.
+    function _bookLiquidity(PoolId poolId) internal view returns (uint amount0, uint amount1) {
+        PairConfig memory cfg = pairConfig[poolId];
+        Book storage book = books[poolId];
+        uint baseAmt = _sideBase(book.ask, cfg.baseLiqUnit);
+        uint quoteAmt = _sideQuote(book.bid, cfg.tickWidth, cfg.baseLiqUnit);
+        (amount0, amount1) = cfg.baseIsCurrency0 ? (baseAmt, quoteAmt) : (quoteAmt, baseAmt);
+    }
+
+    /// @inheritdoc IHookStats
+    /// @dev The book IS the hook's reserves (no separate custody to report): everything the hook
+    /// holds for a pair is either sitting in the ask/bid book or already claimed by a trade, so
+    /// this reuses the exact same per-pair book accounting as `pseudoTotalValueLocked`.
+    function getReserves(PoolKey calldata key) external view returns (uint amount0, uint amount1) {
+        return _bookLiquidity(key.toId());
+    }
+
+    /// @inheritdoc IHookStats
+    /// @dev All of HyFi's book liquidity is immediately swappable (no time-locks, vaults or
+    /// utilization limits), so effective liquidity equals total reserves - same underlying
+    /// accounting as `pseudoTotalValueLocked`/`getReserves`.
+    function getEffectiveLiquidity(PoolKey calldata key) external view returns (uint amount0, uint amount1) {
+        return _bookLiquidity(key.toId());
+    }
+
+    /// @inheritdoc IHookStats
+    function hook() external view returns (address) {
+        return address(this);
+    }
+
+    /// @inheritdoc IERC165
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+        return interfaceId == type(IHookStats).interfaceId || interfaceId == type(IERC165).interfaceId;
     }
 }
