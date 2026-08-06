@@ -22,6 +22,7 @@ import {IPositionManager} from "@uniswap/v4-periphery/src/interfaces/IPositionMa
 import {Commands} from "@uniswap/universal-router/contracts/libraries/Commands.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 
 interface IUniversalRouterMinimal {
@@ -44,6 +45,7 @@ contract Utils is CommonBase {
     uint public constant SCALE = 1e24; // must match HyFi.SCALE
     uint public constant PIPS = 1e6; // must match HyFi.PIPS
     uint public constant NUM_TICKS = 68; // must match HyFi.NUM_TICKS
+    uint public constant Q96 = 0x1000000000000000000000000; // 2**96, must match HyFi.Q96
 
     /// @dev beforeInitialize | beforeAddLiquidity | beforeSwap | beforeSwapReturnDelta
     uint160 public constant HOOK_FLAGS = uint160(Hooks.BEFORE_INITIALIZE_FLAG | Hooks.BEFORE_ADD_LIQUIDITY_FLAG | Hooks.BEFORE_SWAP_FLAG | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG);
@@ -252,6 +254,119 @@ contract Utils is CommonBase {
             }
         }
         require(remaining == 0, "Utils: book too small");
+    }
+
+    // ------------------------------------------------------------------
+    // swapToPrice test helpers (mirror HyFi's price-bounded walk / sqrt-price conversion)
+    // ------------------------------------------------------------------
+
+    /// @notice Mirrors HyFi's `_priceLimitFromSqrt`: converts a v4 sqrt-price limit into HyFi's
+    /// book-price units (quote-wei per base-wei, x1e24). Rounds so a tick sitting exactly at the
+    /// limit stays fillable (down for a bid floor, up for an ask ceiling), matching HyFi. Used to
+    /// compute the exact limit a `swapToPrice` call will walk against.
+    function bookPriceLimitFromSqrt(uint160 sqrtPriceLimitX96, bool baseIsCurrency0, bool isBid)
+        public
+        pure
+        returns (uint priceLimit)
+    {
+        uint priceX96 = FullMath.mulDiv(uint(sqrtPriceLimitX96), uint(sqrtPriceLimitX96), Q96);
+        if (baseIsCurrency0) {
+            priceLimit = isBid
+                ? FullMath.mulDiv(priceX96, SCALE, Q96)
+                : FullMath.mulDivRoundingUp(priceX96, SCALE, Q96);
+        } else {
+            if (priceX96 == 0) return type(uint).max;
+            priceLimit = isBid
+                ? FullMath.mulDiv(SCALE, Q96, priceX96)
+                : FullMath.mulDivRoundingUp(SCALE, Q96, priceX96);
+        }
+    }
+
+    /// @notice Inverse of {bookPriceLimitFromSqrt}: builds a `sqrtPriceLimitX96` targeting
+    /// `bookPrice` (quote-wei per base-wei, x1e24). Rounds the integer square root to nearest so
+    /// the round trip through HyFi's inclusive `_priceLimitFromSqrt` lands on `bookPrice` (a tick
+    /// priced exactly at `bookPrice` is included on both the bid and ask sides).
+    function sqrtPriceX96FromBookPrice(uint bookPrice, bool baseIsCurrency0) public pure returns (uint160) {
+        uint priceX96 =
+            baseIsCurrency0 ? FullMath.mulDiv(bookPrice, Q96, SCALE) : FullMath.mulDiv(SCALE, Q96, bookPrice);
+        uint n = priceX96 * Q96;
+        uint r = Math.sqrt(n);
+        if (n - r * r > r) ++r; // round the integer sqrt to nearest
+        return uint160(r);
+    }
+
+    /// @notice Mirrors BaseAggregatorHook's `_calculateProtocolFeeAmount`: the protocol-fee
+    /// portion of `amountUnspecified` (output for exact-input, input for exact-output).
+    function protocolFeeAmount(uint24 protocolFeePips, bool isExactInput, uint amountUnspecified)
+        public
+        pure
+        returns (uint)
+    {
+        return isExactInput
+            ? FullMath.mulDivRoundingUp(amountUnspecified, protocolFeePips, PIPS)
+            : FullMath.mulDivRoundingUp(amountUnspecified, protocolFeePips, PIPS - protocolFeePips);
+    }
+
+    /// @notice Independent reimplementation of the price-bounded base-consuming walk (fresh book,
+    /// cur = 0): stops once a tick's price crosses `priceLimit` or `baseTarget` is exhausted,
+    /// whichever comes first. Mirrors `_walkBase` with `simulate = true`.
+    /// @return baseConsumed Base wei actually consumed (<= baseTarget).
+    /// @return quoteAmount The corresponding quote amount for the base consumed.
+    function expectedWalkBaseLimited(
+        uint8[] memory ticks,
+        uint tip,
+        bool isBid,
+        uint tickWidth,
+        uint liqUnit,
+        uint baseTarget,
+        bool roundUp,
+        uint priceLimit
+    ) public pure returns (uint baseConsumed, uint quoteAmount) {
+        uint remaining = baseTarget;
+        for (uint i; i < ticks.length && remaining != 0; ++i) {
+            uint avail = uint(ticks[i]) * liqUnit;
+            if (avail == 0) continue;
+            uint price = tickPrice(tip, i, isBid, tickWidth);
+            if (isBid ? price < priceLimit : price > priceLimit) break;
+            uint take = remaining >= avail ? avail : remaining;
+            quoteAmount += baseToQuote(take, price, roundUp);
+            baseConsumed += take;
+            remaining -= take;
+        }
+    }
+
+    /// @notice Independent reimplementation of the price-bounded quote-consuming walk (fresh book,
+    /// cur = 0). Mirrors `_walkQuote` with `simulate = true`.
+    /// @return baseAmount Base wei delivered/consumed for the quote actually walked.
+    /// @return quoteConsumed Quote wei actually consumed (<= quoteTarget).
+    function expectedWalkQuoteLimited(
+        uint8[] memory ticks,
+        uint tip,
+        bool isBid,
+        uint tickWidth,
+        uint liqUnit,
+        uint quoteTarget,
+        bool quoteIsInput,
+        uint priceLimit
+    ) public pure returns (uint baseAmount, uint quoteConsumed) {
+        uint remaining = quoteTarget;
+        for (uint i; i < ticks.length && remaining != 0; ++i) {
+            uint avail = uint(ticks[i]) * liqUnit;
+            if (avail == 0) continue;
+            uint price = tickPrice(tip, i, isBid, tickWidth);
+            if (isBid ? price < priceLimit : price > priceLimit) break;
+            uint tickQuote = baseToQuote(avail, price, quoteIsInput);
+            if (remaining >= tickQuote) {
+                baseAmount += avail;
+                quoteConsumed += tickQuote;
+                remaining -= tickQuote;
+            } else {
+                uint basePart = quoteToBase(remaining, price, !quoteIsInput);
+                baseAmount += basePart;
+                quoteConsumed += remaining;
+                remaining = 0;
+            }
+        }
     }
 
     // ------------------------------------------------------------------

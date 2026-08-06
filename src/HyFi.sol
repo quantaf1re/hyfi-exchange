@@ -5,12 +5,14 @@ import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {FullMath} from "@uniswap/v4-core/src/libraries/FullMath.sol";
 import {SafeCast} from "@uniswap/v4-core/src/libraries/SafeCast.sol";
+import {TickMath} from "@uniswap/v4-core/src/libraries/TickMath.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
 import {PoolId} from "@uniswap/v4-core/src/types/PoolId.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
 import {SwapParams} from "@uniswap/v4-core/src/types/PoolOperation.sol";
 import {BaseAggregatorHook} from "@uniswap/v4-hooks-public/aggregator-hooks/BaseAggregatorHook.sol";
 import {IHookStats} from "./interfaces/IHookStats.sol";
+import {IALFHook} from "./interfaces/IALFHook.sol";
 import {IERC165} from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
@@ -49,7 +51,7 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 /// Deployment: the hook address must have exactly the beforeInitialize, beforeAddLiquidity,
 /// beforeSwap and beforeSwapReturnDelta flag bits set (mined via CREATE2, per
 /// BaseAggregatorHook.getHookPermissions).
-contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTransient {
+contract HyFi is BaseAggregatorHook, IHookStats, IALFHook, Ownable2Step, ReentrancyGuardTransient {
     using SafeERC20 for IERC20;
     using CurrencyLibrary for Currency;
     using SafeCast for uint;
@@ -68,6 +70,7 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
     uint internal constant HEAD_TICKS = 4; // ticks stored in slot0
     uint internal constant WORD_TICKS = 32; // ticks per full word
     uint internal constant MAX_TICK_INDEX = 67;
+    uint internal constant Q96 = 0x1000000000000000000000000; // 2**96, Uniswap sqrt-price scale
 
     // slot0 bit layout
     uint internal constant TS_SHIFT = 40;
@@ -132,7 +135,9 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
         SideUpdate ask;
     }
 
-    /// @dev In-memory walk state. cur/amountLeft are updated by the walk kernels.
+    /// @dev In-memory walk state. cur/amountLeft are updated by the walk kernels. When `simulate`
+    /// is set (swapToPrice), the kernels also stop at `priceLimit` and on book exhaustion instead
+    /// of reverting, reporting the unfilled portion of the target in `remaining`.
     struct WalkParams {
         uint slot0;
         uint tip;
@@ -142,6 +147,9 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
         uint amountLeft;
         uint end;
         bool isBid;
+        bool simulate;
+        uint priceLimit;
+        uint remaining;
     }
 
     /// @dev Scratch space for trades (avoids stack-too-deep)
@@ -421,7 +429,7 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
         override
         returns (uint amountUnspecified)
     {
-        (TradeState memory t,,,) = _priceTrade(poolId, zeroToOne, amountSpecified);
+        (TradeState memory t,,,) = _priceTrade(poolId, zeroToOne, amountSpecified, false, 0);
         return amountSpecified < 0 ? t.amountOut : t.amountIn;
     }
 
@@ -491,7 +499,7 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
         WalkParams memory w;
         Side storage side;
         uint slot0;
-        (t, w, side, slot0) = _priceTrade(poolId, zeroForOne, amountSpecified);
+        (t, w, side, slot0) = _priceTrade(poolId, zeroForOne, amountSpecified, false, 0);
 
         // Persist the walk pointer
         side.slot0 = (slot0 & CUR_LEFT_CLEAR) | (w.cur << CUR_SHIFT) | (w.amountLeft << LEFT_SHIFT);
@@ -509,9 +517,11 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
     }
 
     /// @dev Prices a trade against the current book with no state changes. Shared by _trade
-    /// (which then persists the walk pointer) and the quote paths, so that quotes can never
-    /// diverge from execution.
-    function _priceTrade(PoolId poolId, bool zeroForOne, int amountSpecified)
+    /// (which then persists the walk pointer), the direct quotes, and `swapToPrice`, so that
+    /// quotes and price-bounded simulations can never diverge from execution. When `simulate` is
+    /// set the walk stops at `priceLimit` (in book-price units) or on book exhaustion instead of
+    /// reverting, and amounts are taken from the portion actually filled.
+    function _priceTrade(PoolId poolId, bool zeroForOne, int amountSpecified, bool simulate, uint priceLimit)
         internal
         view
         returns (TradeState memory t, WalkParams memory w, Side storage side, uint slot0)
@@ -528,8 +538,8 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
         side = t.isSellingBase ? books[poolId].bid : books[poolId].ask;
         slot0 = side.slot0;
 
-        // Staleness fee in pips, accrued per second since the inputted book timestamp, capped at 100%
-        // (book timestamps are validated <= block.timestamp at update time)
+        // Staleness fee in pips, accrued per second since the inputted book timestamp, capped at
+        // 100% (book timestamps are validated <= block.timestamp at update time)
         uint feePips = (block.timestamp - ((slot0 >> TS_SHIFT) & MASK_32)) * cfg.feePerSecond;
         if (feePips > PIPS) feePips = PIPS;
 
@@ -541,26 +551,39 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
             cur: (slot0 >> CUR_SHIFT) & MASK_8,
             amountLeft: (slot0 >> LEFT_SHIFT) & MASK_96,
             end: (slot0 >> END_SHIFT) & MASK_8,
-            isBid: t.isSellingBase
+            isBid: t.isSellingBase,
+            simulate: simulate,
+            priceLimit: priceLimit,
+            remaining: 0
         });
 
         // The fee is always taken in the output token: the book is walked for the gross output
-        // and the trader receives the net; the difference stays in the contract for the MMs.
+        // and the trader receives the net; the difference stays in the contract for the MMs. Under
+        // a price limit the walk can stop early, so amounts come from the gross output actually
+        // filled (w.remaining is always 0 for a non-simulated / full fill, leaving these unchanged).
         if (t.isExactInput) {
-            t.amountIn = amtSpecified;
             uint grossOut = t.isSellingBase
                 ? _walkBase(side, w, amtSpecified, false) // quote out: round down
                 : _walkQuote(side, w, amtSpecified, true); // quote is the input
+            t.amountIn = amtSpecified - w.remaining;
             t.fee = FullMath.mulDivRoundingUp(grossOut, feePips, PIPS);
             t.amountOut = grossOut - t.fee;
         } else {
             require(feePips < PIPS, BookTooStale());
-            t.amountOut = amtSpecified;
-            uint grossOut = FullMath.mulDivRoundingUp(amtSpecified, PIPS, PIPS - feePips);
-            t.fee = grossOut - amtSpecified;
+            uint grossTarget = FullMath.mulDivRoundingUp(amtSpecified, PIPS, PIPS - feePips);
             t.amountIn = t.isSellingBase
-                ? _walkQuote(side, w, grossOut, false) // quote is the output target, base in
-                : _walkBase(side, w, grossOut, true); // quote in: round up
+                ? _walkQuote(side, w, grossTarget, false) // quote is the output target, base in
+                : _walkBase(side, w, grossTarget, true); // quote in: round up
+            if (w.remaining == 0) {
+                // Full fill: deliver exactly the requested net output.
+                t.amountOut = amtSpecified;
+                t.fee = grossTarget - amtSpecified;
+            } else {
+                // Price-limited partial fill: staleness fee on the gross output actually filled.
+                uint grossFilled = grossTarget - w.remaining;
+                t.fee = FullMath.mulDivRoundingUp(grossFilled, feePips, PIPS);
+                t.amountOut = grossFilled - t.fee;
+            }
         }
     }
 
@@ -610,7 +633,10 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
         uint[2] memory words;
         bool[2] memory isLoaded;
         while (remaining != 0) {
-            require(i <= w.end, InsufficientLiquidity());
+            if (i > w.end) {
+                if (w.simulate) break; // price-bounded simulation returns the partial fill
+                revert InsufficientLiquidity();
+            }
             uint avail;
             if (i == start && w.amountLeft != 0) {
                 avail = w.amountLeft; // partially consumed tick from a previous trade
@@ -622,6 +648,8 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
                 }
             }
             uint price = (w.isBid ? w.tip - i : w.tip + i) * w.tickWidth;
+            // Stop once the next tick's book price crosses the limit (checked pre-fee, as in v4)
+            if (w.simulate && (w.isBid ? price < w.priceLimit : price > w.priceLimit)) break;
             if (remaining >= avail) {
                 quoteAmount += isRoundUp ? FullMath.mulDivRoundingUp(avail, price, SCALE) : FullMath.mulDiv(avail, price, SCALE);
                 remaining -= avail;
@@ -634,6 +662,7 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
         }
         w.cur = i;
         w.amountLeft = newLeft;
+        w.remaining = remaining;
     }
 
     /// @dev Walks the book consuming exactly `quoteTarget` quote wei, returning the corresponding
@@ -654,7 +683,10 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
         uint[2] memory words;
         bool[2] memory isLoaded;
         while (remaining != 0) {
-            require(i <= w.end, InsufficientLiquidity());
+            if (i > w.end) {
+                if (w.simulate) break; // price-bounded simulation returns the partial fill
+                revert InsufficientLiquidity();
+            }
             uint avail;
             if (i == start && w.amountLeft != 0) {
                 avail = w.amountLeft;
@@ -666,6 +698,8 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
                 }
             }
             uint price = (w.isBid ? w.tip - i : w.tip + i) * w.tickWidth;
+            // Stop once the next tick's book price crosses the limit (checked pre-fee, as in v4)
+            if (w.simulate && (w.isBid ? price < w.priceLimit : price > w.priceLimit)) break;
             uint availInQuote = quoteIsInput ? FullMath.mulDivRoundingUp(avail, price, SCALE) : FullMath.mulDiv(avail, price, SCALE);
             if (remaining >= availInQuote) {
                 baseAmount += avail;
@@ -684,6 +718,7 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
         }
         w.cur = i;
         w.amountLeft = newLeft;
+        w.remaining = remaining;
     }
 
     // =======================================================================
@@ -702,7 +737,7 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
         view
         returns (uint amountIn, uint amountOut, uint stalenessFee, uint40 bookId)
     {
-        (TradeState memory t,,, uint slot0) = _priceTrade(poolId, zeroForOne, amountSpecified);
+        (TradeState memory t,,, uint slot0) = _priceTrade(poolId, zeroForOne, amountSpecified, false, 0);
         return (t.amountIn, t.amountOut, t.fee, uint40((slot0 >> ID_SHIFT) & MASK_40));
     }
 
@@ -781,6 +816,128 @@ contract HyFi is BaseAggregatorHook, IHookStats, Ownable2Step, ReentrancyGuardTr
 
     /// @inheritdoc IERC165
     function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
-        return interfaceId == type(IHookStats).interfaceId || interfaceId == type(IERC165).interfaceId;
+        return interfaceId == type(IHookStats).interfaceId || interfaceId == type(IALFHook).interfaceId
+            || interfaceId == type(IERC165).interfaceId;
+    }
+
+    // =======================================================================
+    // URC-4 Active Liquidity Framework (ALF)
+    // =======================================================================
+
+    /// @notice Conservative gas budget routers may set on `getIndicativeQuote` calls. Sized for a
+    /// full-book walk (68 ticks, cold SLOADs) plus the external self-call overhead.
+    uint32 public constant MAX_QUOTE_GAS = 200_000;
+
+    /// @inheritdoc IALFHook
+    /// @dev Non-binding quote for the via-Uniswap trading path: priced by the same book code as
+    /// execution and then grossed/netted by the pool's protocol fee. HyFi needs no payload, so
+    /// `hookData` is ignored. Reverts for a pool key that is not this hook or an unconfigured
+    /// pair; returns 0 for a zero amount or when the book cannot serve the swap (insufficient
+    /// liquidity, too stale). Non-view because the base's `quote` refreshes the token jar.
+    function getIndicativeQuote(PoolKey calldata key, bool zeroForOne, int256 amountSpecified, bytes calldata)
+        external
+        returns (uint256 quoteAmount)
+    {
+        require(address(key.hooks) == address(this), InvalidPoolKey());
+        PoolId poolId = key.toId();
+        require(pairConfig[poolId].tickWidth != 0, PairNotConfigured());
+        if (amountSpecified == 0) return 0;
+
+        // Unavailable liquidity / stale book must return 0 rather than revert; catch the pricing
+        // reverts via an external self-call to the protocol-fee-inclusive quote. `quote` returns
+        // the unspecified amount (output for exact-input, input for exact-output).
+        try this.quote(zeroForOne, amountSpecified, poolId) returns (uint amountUnspecified) {
+            return amountUnspecified;
+        } catch {
+            return 0;
+        }
+    }
+
+    /// @inheritdoc IALFHook
+    /// @dev HyFi has no oracle/attestation/external-venue dependency that can go stale at the hook
+    /// level; per-pair unavailability surfaces through `getIndicativeQuote` returning 0.
+    function isLive() external pure returns (bool) {
+        return true;
+    }
+
+    /// @inheritdoc IALFHook
+    function maxGas() external pure returns (uint32) {
+        return MAX_QUOTE_GAS;
+    }
+
+    /// @inheritdoc IALFHook
+    /// @dev Price-bounded simulation of the via-Uniswap path, priced on the same `_priceTrade`
+    /// code as execution. Converts the v4 `sqrtPriceLimitX96` into HyFi's book-price units and
+    /// lets the book walk stop once a tick's raw (pre-fee) price crosses it or the amount is
+    /// exhausted, whichever comes first, then layers on the pool's Uniswap protocol fee. The limit
+    /// is compared pre-fee, exactly as v4 bounds the pool price before fees. Following the ALF / v4
+    /// convention, "no limit" is expressed by MIN_SQRT_PRICE+1 / MAX_SQRT_PRICE-1 (which price the
+    /// full amount, bounded only by available liquidity); a `sqrtPriceLimitX96` at or past
+    /// MIN_SQRT_PRICE / MAX_SQRT_PRICE (including 0) is untradable and returns (0, 0), matching
+    /// SwapSimulator's soft-fail contract. `amountSpecified` follows the v4 sign convention
+    /// (negative = exact input, positive = exact-output net amount). Returns the realized (amountIn
+    /// incl. fees, amountOut net); (0, 0) when nothing fills within the limit. Ignores `hookData`
+    /// (HyFi needs no payload).
+    function swapToPrice(
+        PoolKey calldata key,
+        bool zeroForOne,
+        int256 amountSpecified,
+        uint160 sqrtPriceLimitX96,
+        bytes calldata
+    ) external view returns (uint256 amountIn, uint256 amountOut) {
+        require(address(key.hooks) == address(this), InvalidPoolKey());
+        PoolId poolId = key.toId();
+        PairConfig memory cfg = pairConfig[poolId];
+        require(cfg.tickWidth != 0, PairNotConfigured());
+        if (amountSpecified == 0) return (0, 0);
+        // Only a limit strictly inside (MIN_SQRT_PRICE, MAX_SQRT_PRICE) is tradable, matching
+        // SwapSimulator's soft-fail contract. "No limit" is signalled by MIN_SQRT_PRICE+1 /
+        // MAX_SQRT_PRICE-1 (they convert to non-binding book limits below), not by 0; a 0 or any
+        // out-of-range value is untradable and returns (0, 0).
+        if (sqrtPriceLimitX96 <= TickMath.MIN_SQRT_PRICE || sqrtPriceLimitX96 >= TickMath.MAX_SQRT_PRICE) {
+            return (0, 0);
+        }
+
+        // Convert the sqrt-price limit into book-price units, then price on the execution path.
+        uint priceLimit = _priceLimitFromSqrt(sqrtPriceLimitX96, cfg.baseIsCurrency0, zeroForOne == cfg.baseIsCurrency0);
+        (TradeState memory t,,,) = _priceTrade(poolId, zeroForOne, amountSpecified, true, priceLimit);
+        (amountIn, amountOut) = (t.amountIn, t.amountOut);
+        if (amountOut == 0) return (0, 0); // best book price already past the limit
+
+        // Layer on the Uniswap protocol fee (view mirror of BaseAggregatorHook._innerQuote).
+        uint24 protocolFee = _getProtocolFee(poolManager, zeroForOne, poolId);
+        if (protocolFee != 0 && _getTokenJar(poolManager) != address(0)) {
+            if (amountSpecified < 0) {
+                amountOut -= _calculateProtocolFeeAmount(protocolFee, true, amountOut);
+            } else {
+                amountIn += _calculateProtocolFeeAmount(protocolFee, false, amountIn);
+            }
+        }
+    }
+
+    /// @dev Converts a v4 `sqrtPriceLimitX96` (Q64.96 sqrt of currency1/currency0) into HyFi's
+    /// book-price units (quote-wei per base-wei, scaled by 1e24) so it can be compared directly to
+    /// a tick's `(tip +/- i) * tickWidth`. Accounts for base/quote orientation (quote/base = P
+    /// when the base is currency0, else 1/P) and rounds so a tick sitting exactly at the limit is
+    /// still fillable (down for a bid floor, up for an ask ceiling): the walk includes trades at
+    /// exactly `priceLimit`, so the boundary tick is never rounded out of range.
+    function _priceLimitFromSqrt(uint160 sqrtPriceLimitX96, bool baseIsCurrency0, bool isBid)
+        internal
+        pure
+        returns (uint priceLimit)
+    {
+        uint priceX96 = FullMath.mulDiv(uint(sqrtPriceLimitX96), uint(sqrtPriceLimitX96), Q96); // P * 2**96
+        if (baseIsCurrency0) {
+            // quote/base = P  =>  L = P * 1e24
+            priceLimit = isBid
+                ? FullMath.mulDiv(priceX96, SCALE, Q96)
+                : FullMath.mulDivRoundingUp(priceX96, SCALE, Q96);
+        } else {
+            // quote/base = 1/P  =>  L = 1e24 / P.  P -> 0 leaves no upper bound on quote/base.
+            if (priceX96 == 0) return type(uint).max;
+            priceLimit = isBid
+                ? FullMath.mulDiv(SCALE, Q96, priceX96)
+                : FullMath.mulDivRoundingUp(SCALE, Q96, priceX96);
+        }
     }
 }
