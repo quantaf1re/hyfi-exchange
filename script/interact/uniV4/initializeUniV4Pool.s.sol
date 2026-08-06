@@ -1,12 +1,12 @@
 pragma solidity ^0.8.30;
 
 import {Script, console2} from "forge-std/Script.sol";
-import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import {Utils} from "../../../test/Utils.sol";
-import {AddressConstants} from "hookmate/constants/AddressConstants.sol";
+import {Addrs} from "../../Addrs.sol";
+import {HyFi} from "../../../src/HyFi.sol";
 import {IPoolManager} from "@uniswap/v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "@uniswap/v4-core/src/types/PoolKey.sol";
-import {Currency, CurrencyLibrary} from "@uniswap/v4-core/src/types/Currency.sol";
+import {Currency} from "@uniswap/v4-core/src/types/Currency.sol";
 import {IHooks} from "@uniswap/v4-core/src/interfaces/IHooks.sol";
 import {StateLibrary} from "@uniswap/v4-core/src/libraries/StateLibrary.sol";
 
@@ -15,23 +15,24 @@ contract InitializeUniV4Pool is Script, Utils {
 
     using StateLibrary for IPoolManager;
 
-    uint public senderPrivateKey = vm.envUint("PRIVATE_KEY_HYFIHOOK_DEPLOYER");
+    uint public senderPrivateKey = vm.envUint("PRIVATE_KEY_HYFI_DEPLOYER");
     address public sender = vm.addr(senderPrivateKey);
 
-    IPoolManager public pm = IPoolManager(0x8366a39CC670B4001A1121B8F6A443A643e40951);
+    HyFi public hyfi = getHyFi(block.chainid);
+    IPoolManager public pm = getPm(block.chainid);
+
+    PoolKey public poolKey = PoolKey({
+        currency0: Currency.wrap(Addrs.get(block.chainid, "USDG")),
+        currency1: Currency.wrap(Addrs.get(block.chainid, "NVDA")),
+        fee: 0,
+        tickSpacing: 1,
+        hooks: IHooks(address(hyfi))
+    });
 
     function run() public {
         vm.startBroadcast(senderPrivateKey);
-
-        PoolKey memory poolKey = PoolKey({
-            currency0: Currency.wrap(0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168), // USDG on Robin
-            currency1: Currency.wrap(0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC), // NVDA on Robin
-            fee: 0,
-            tickSpacing: 1,
-            hooks: IHooks(0x83432ccbf6A058856E90698EcB47561e25f08a88)
-        });
-
-        pm.initialize(poolKey, getSqrtPriceX96FromPrice(1 ether, false, 18, 18));
+        pm.initialize(poolKey, SQRT_PRICE_1_1);
+        vm.stopBroadcast();
 
         (uint160 sqrtPriceX96, int24 tick, , ) = pm.getSlot0(poolKey.toId());
         console2.log("sqrtPriceX96:", sqrtPriceX96);
