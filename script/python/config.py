@@ -65,7 +65,7 @@ CHAINS = {
             'max_attempts': 5,
         },
         'contracts': {
-            'hyfi': '0xE06495094a44987833219A48B175C5c30D426088',
+            'hyfi': '0x2AC29f18B22a12917D4653406B0D2Fe7B592A888',
         },
         'tokens': {
             'ETH': {'addr': NATIVE, 'decs': 18},

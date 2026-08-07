@@ -31,8 +31,8 @@ contract AddLiquidityUniV4Pool is Script, Utils {
     IPositionManager public positionManager = getPositionManager(block.chainid);
 
     PoolKey public poolKey = PoolKey({
-        currency0: Currency.wrap(Addrs.get(block.chainid, "USDG")),
-        currency1: Currency.wrap(Addrs.get(block.chainid, "NVDA")),
+        currency0: getCurrency(block.chainid, "USDG"),
+        currency1: getCurrency(block.chainid, "NVDA"),
         fee: 0,
         tickSpacing: 1,
         hooks: IHooks(address(hyfi))
@@ -49,7 +49,6 @@ contract AddLiquidityUniV4Pool is Script, Utils {
 
         vm.startBroadcast(senderPrivateKey);
 
-        IERC20Metadata token0 = IERC20Metadata(Currency.unwrap(poolKey.currency0));
         IERC20Metadata token1 = IERC20Metadata(Currency.unwrap(poolKey.currency1));
 
         (int24 tickLower, int24 tickUpper, uint128 liquidity, uint am0Max, uint am1Max) = _computeMintAmounts(token1);
@@ -59,7 +58,7 @@ contract AddLiquidityUniV4Pool is Script, Utils {
         // Mint Liquidity
         params[0] = abi.encodeWithSelector(positionManager.modifyLiquidities.selector, abi.encode(actions, mintParams), block.timestamp + 60);
 
-        tokensApprovals(sender, positionManager, token0, token1);
+        tokensApprovals(sender, positionManager, IERC20Metadata(Currency.unwrap(poolKey.currency0)), IERC20Metadata(Currency.unwrap(poolKey.currency1)));
         console2.log("Minting position...");
         
         // Record logs to capture the Transfer event

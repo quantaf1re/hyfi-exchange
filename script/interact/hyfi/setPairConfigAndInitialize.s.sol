@@ -24,10 +24,8 @@ contract SetPairConfigAndInitialize is Script, Utils {
     /// @dev Price granularity: 1 tick = `tickQuoteWei` quote-wei per whole base token
     uint public tickQuoteWei = 10 ** 4;
     uint8 public baseDecimals = 18;
-
     /// @dev Base-token wei represented by 1 unit of tick liquidity
     uint88 public baseLiqUnit = 1e17;
-
     /// @dev Staleness fee in pips (1e-6), charged per second since the book timestamp
     uint24 public feePerSecond = 100;
 

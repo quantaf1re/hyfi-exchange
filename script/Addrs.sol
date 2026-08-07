@@ -16,10 +16,15 @@ library Addrs {
             if (h == keccak256("PositionManager")) return 0x58daec3116aae6D93017bAAea7749052E8a04fA7;
             if (h == keccak256("UniversalRouter")) return 0x8876789976dEcBfCbBbe364623C63652db8C0904;
             if (h == keccak256("Permit2")) return 0x000000000022D473030F116dDEE9F6B43aC78BA3;
+            if (h == keccak256("NATIVE")) return address(0);
             if (h == keccak256("USDG")) return 0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168;
             if (h == keccak256("NVDA")) return 0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC;
-            if (h == keccak256("HyFi")) return 0xE06495094a44987833219A48B175C5c30D426088;
+            if (h == keccak256("HyFi")) return 0x2AC29f18B22a12917D4653406B0D2Fe7B592A888;
         }
         revert UnknownAddress(chainId, name);
+    }
+
+    function get(string memory name) internal view returns (address) {
+        return get(block.chainid, name);
     }
 }

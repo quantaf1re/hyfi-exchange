@@ -22,8 +22,8 @@ contract InitializeUniV4Pool is Script, Utils {
     IPoolManager public pm = getPm(block.chainid);
 
     PoolKey public poolKey = PoolKey({
-        currency0: Currency.wrap(Addrs.get(block.chainid, "USDG")),
-        currency1: Currency.wrap(Addrs.get(block.chainid, "NVDA")),
+        currency0: getCurrency(block.chainid, "USDG"),
+        currency1: getCurrency(block.chainid, "NVDA"),
         fee: 0,
         tickSpacing: 1,
         hooks: IHooks(address(hyfi))

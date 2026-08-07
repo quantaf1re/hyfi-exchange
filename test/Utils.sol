@@ -368,9 +368,19 @@ contract Utils is CommonBase {
         return HyFi(payable(Addrs.get(chainId, "HyFi")));
     }
 
-    /// @notice Resolves an ERC20 by its name/symbol in the address book
-    function getERC20(uint chainId, string memory name) public pure returns (IERC20) {
-        return IERC20(Addrs.get(chainId, name));
+    /// @notice Resolves an ERC20 by its name/symbol in the address book, returning full metadata interface
+    function getERC20(uint chainId, string memory name) public pure returns (IERC20Metadata) {
+        return IERC20Metadata(Addrs.get(chainId, name));
+    }
+
+    /// @notice Resolves a currency by its name/symbol in the address book
+    function getCurrency(uint chainId, string memory name) public pure returns (Currency) {
+        return Currency.wrap(Addrs.get(chainId, name));
+    }
+
+    /// @notice Returns the balance of a token (or native if address is 0x0) for an account
+    function balanceOf(address token, address account) public view returns (uint256) {
+        return token == address(0) ? account.balance : IERC20Metadata(token).balanceOf(account);
     }
 
     // ------------------------------------------------------------------
@@ -409,6 +419,12 @@ contract Utils is CommonBase {
     /// @notice Logs a labeled wei-denominated token amount as "label: 2.5 NVDA"
     function logTokenAmount(string memory label, string memory symbol, uint amount, uint8 decimals) internal pure {
         console2.log(string.concat(label, ": ", formatNumToStrDecimal(amount, decimals), " ", symbol));
+    }
+
+    /// @notice Logs a labeled wei-denominated token amount, resolving symbol/decimals from the currency
+    function logTokenAmount(string memory label, Currency currency, uint amount) internal view {
+        IERC20Metadata token = IERC20Metadata(Currency.unwrap(currency));
+        logTokenAmount(label, token.symbol(), amount, token.decimals());
     }
 
     /// @notice Extracts the `tokenId` of the first ERC721 `Transfer` event sent `to` recipient

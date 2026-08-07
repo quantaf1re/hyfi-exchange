@@ -27,9 +27,21 @@ contract SwapHookViaUniversalRouter is Script, Utils {
     IUniversalRouterMinimal public universalRouter = getRouter(block.chainid);
     IPermit2Minimal public permit2 = getPermit2(block.chainid);
 
-    Currency public currency0 = Currency.wrap(Addrs.get(block.chainid, "USDG"));
-    Currency public currency1 = Currency.wrap(Addrs.get(block.chainid, "NVDA"));
+    Currency public currency0 = getCurrency(block.chainid, "USDG");
+    Currency public currency1 = getCurrency(block.chainid, "NVDA");
     IERC20Metadata public token1 = IERC20Metadata(Currency.unwrap(currency1));
+
+    // Swap config
+    // bool public swapZeroForOne = true;
+    // uint public amountIn = 10e6;
+    bool public swapZeroForOne = false;
+    uint public amountIn = 0.2e18;
+    uint public slippageBps = 100;
+    uint public constant BPS_DENOM = 10_000;
+    uint public constant DEADLINE_BUFFER = 5 minutes;
+    string public nativeSymbol = "MATIC";
+    uint8 public constant NATIVE_DECIMALS = 18;
+    bytes1 internal constant V4_SWAP_COMMAND = bytes1(uint8(0x10));
     PoolKey public poolKey = PoolKey({
         currency0: currency0,
         currency1: currency1,
@@ -37,18 +49,6 @@ contract SwapHookViaUniversalRouter is Script, Utils {
         tickSpacing: 1,
         hooks: IHooks(address(hyfi))
     });
-
-    // Swap config
-    bool public swapZeroForOne = true;
-    // bool public swapZeroForOne = false;
-    uint public amountIn = 10e6;
-    // uint public amountIn = 0.2e18;
-    uint public slippageBps = 100;
-    uint public constant BPS_DENOM = 10_000;
-    uint public constant DEADLINE_BUFFER = 5 minutes;
-    string public nativeSymbol = "MATIC";
-    uint8 public constant NATIVE_DECIMALS = 18;
-    bytes1 internal constant V4_SWAP_COMMAND = bytes1(uint8(0x10));
 
     // ----------- Swap state -----------
     // Set at declaration (rather than as locals in run()) to avoid a stack-too-deep error.
